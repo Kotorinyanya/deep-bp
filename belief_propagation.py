@@ -40,7 +40,7 @@ class BeliefPropagation(nn.Module):
         self.logger = logging.getLogger(str(self.__class__.__name__))
         self.num_workers = num_workers
         self.bp_dumping_rate = bp_dumping_rate
-        self.bp_max_diff = bp_max_diff
+        self.bp_max_diff = bp_max_diff  # max_diff = max_diff / num_groups ?
         self.max_num_iter = max_num_iter
         self.num_groups = num_groups
 
@@ -83,7 +83,9 @@ class BeliefPropagation(nn.Module):
         # _, assignment = torch.max(self.marginal_psi, 1)  # unweighted
         modularity = self.compute_modularity()
         reg = self.compute_reg()
-        entropy_loss = self.entropy_loss(self.marginal_psi)  # * self.mean_degree * self.mean_degree / self.num_groups
+        entropy_loss = self.entropy_loss(self.marginal_psi) * \
+                       4 * np.log(1 / 2) / np.log(1 / self.num_groups)
+        # or * self.mean_degree * self.mean_degree / self.num_groups
 
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
         self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1}".format(is_converge, num_iter))
@@ -145,7 +147,7 @@ class BeliefPropagation(nn.Module):
                     diff = result
                     max_diff = diff if diff > max_diff else max_diff
             end = time.time()
-            self.logger.debug(
+            self.logger.info(
                 "num_iter \t {:3d} \t time \t {:.2f} \t max_diff {}".format(num_iter, end - start, max_diff))
 
             if max_diff < self.bp_max_diff:
@@ -159,7 +161,7 @@ class BeliefPropagation(nn.Module):
         marginal_psi_i = self.update_marginal_psi(i)
 
         i_to_j = list(self.G.neighbors(i)).index(j)
-        diff = torch.pow((message_i_to_j - self.message_map[i][i_to_j]), 2).sum()
+        diff = (message_i_to_j - self.message_map[i][i_to_j]).abs().sum()
 
         with self._lock_mmap[i][i_to_j]:
             self.message_map[i][i_to_j] = self.bp_dumping_rate * message_i_to_j.clone() \
