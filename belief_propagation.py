@@ -82,9 +82,8 @@ class BeliefPropagation(nn.Module):
         assignment_matrix = self.marginal_psi  # weighted
         # _, assignment = torch.max(self.marginal_psi, 1)  # unweighted
         modularity = self.compute_modularity()
-        reg = self.compute_reg()
-        entropy_loss = self.entropy_loss(self.marginal_psi) * \
-                       4 * np.log(1 / 2) / np.log(1 / self.num_groups)
+        reg = self.compute_reg() * np.sqrt(self.num_groups)
+        entropy_loss = self.entropy_loss(self.marginal_psi) / np.log(self.num_groups)
         # or * self.mean_degree * self.mean_degree / self.num_groups
 
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
