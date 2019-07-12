@@ -67,12 +67,13 @@ class BeliefPropagation(nn.Module):
                 "Please pass the mean degree of the network by argument "
                 "when calling, for example BeliefPropagation(number_of_groups=q, mean_degree=c)"
             )
-            beta = torch.tensor(1.0, dtype=torch.float).unsqueeze(-1)
+            beta = torch.tensor(1.0, dtype=torch.float)
         elif mean_degree > 0:
-            mean_degree = torch.tensor(mean_degree)
-            beta = torch.log(
-                self.num_groups / (torch.sqrt(torch.tensor(mean_degree, dtype=torch.float)) - 1) + 1
-            ).unsqueeze(-1)
+            # beta = torch.log(
+            #     self.num_groups / (torch.sqrt(torch.tensor(mean_degree, dtype=torch.float)) - 1) + 1
+            # ).unsqueeze(-1)
+            beta = np.log(self.num_groups / np.sqrt(mean_degree - 1) + 1)
+            beta = torch.tensor(beta, dtype=torch.float)
         self.beta = nn.Parameter(data=beta)
 
         # self.logger.info('\t mean_degree \t {0:.2f} \t beta \t {1} \t '.format(mean_degree, self.beta.data.item()))
@@ -149,7 +150,7 @@ class BeliefPropagation(nn.Module):
         elif self.bp_implementation_type == 'parallel':
             self.message_map, self.node_id_to_index, self.w_indexed = self.init_messages()
         # initialize external field
-        self.h = (-self.beta * self.mean_w * self.marginal_psi).sum(0)
+        self.h = (-self.beta * self.mean_w * self.marginal_psi.clone()).sum(0)
 
         if not self.is_init:
             if self.bp_implementation_type == 'legacy':
@@ -202,24 +203,26 @@ class BeliefPropagation(nn.Module):
     def update_psi_h_fast(self, i):
         slice_tensor, index_tensor = self._update_psi_index[i]
         # sum all messages
-        src = 1 + self.message_map * (torch.exp(self.beta * self.w_indexed) - 1)
-        out = scatter_mul(src, index_tensor, dim=0)
+        src = 1 + self.message_map.clone() * (torch.exp(self.beta * self.w_indexed) - 1)
+        out = self.marginal_psi.new_ones((self.marginal_psi.shape[0] + 1, self.marginal_psi.shape[1]))
+        out = scatter_mul(src, index_tensor, out=out, dim=0)
+        out = out[:-1][slice_tensor]
         out = out * torch.exp(self.h)
         out = out / out.sum(-1).reshape(-1, 1)
-        new_marginal_psi = out[slice_tensor[:torch.nonzero(slice_tensor).max() + 1]]
+        # new_marginal_psi = out[slice_tensor[:torch.nonzero(slice_tensor).max() + 1]]
         # subtract the old psi
-        self.h -= (-self.beta * self.mean_w * self.marginal_psi[slice_tensor]).sum(0)
+        self.h -= -self.beta * self.mean_w * self.marginal_psi[slice_tensor].clone().sum(0)
         # update marginal_psi
-        self.marginal_psi[slice_tensor] = new_marginal_psi.clone()
+        self.marginal_psi[slice_tensor] = out
         # add the new psi
-        self.h += (-self.beta * self.mean_w * new_marginal_psi).sum(0)
+        self.h += -self.beta * self.mean_w * self.marginal_psi[slice_tensor].clone().sum(0)
 
     def _update_psi_create_index(self, nodes):
         # for updating marginal_psi
         slice_tensor = torch.zeros(self.N, dtype=torch.uint8)
         # for torch_scatter
-        index_tensor = torch.ones(self.message_map.shape[0], dtype=torch.long) * (-1)
-        # -1: a trick ignore all redundant index
+        index_tensor = torch.ones(self.message_map.shape[0], dtype=torch.long) * \
+                       self.marginal_psi.shape[0]  # a trick solve "Invalid index in gather at", but redundant
         for dst_node in nodes:
             slice_tensor[dst_node] = 1  # mark message to write
             neighbors = list(self.G.neighbors(dst_node))
@@ -231,22 +234,25 @@ class BeliefPropagation(nn.Module):
                 message_indexes.append(i_to_j_message_index)
             index_tensor[message_indexes] = int(dst_node)  # index message to read
 
-            assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(slice_tensor).max()
+            # assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(slice_tensor).max()
 
         return slice_tensor, index_tensor
 
     def update_message_fast(self, i):
         slice_tensor, index_tensor = self._update_message_slice_and_index[i]
         # sum all messages
-        src = 1 + self.message_map * (torch.exp(self.beta * self.w_indexed) - 1)
-        out = scatter_mul(src, index_tensor, dim=0)
+        src = 1 + self.message_map.clone() * (torch.exp(self.beta * self.w_indexed) - 1)
+        out = self.message_map.new_ones((self.message_map.shape[0] + 1, self.message_map.shape[1]))
+        out = scatter_mul(src, index_tensor, out=out, dim=0)
+        out = out[:-1]
         out = out * torch.exp(self.h)
         out = out / out.sum(-1).reshape(-1, 1)
-        new_message = out[slice_tensor[:torch.nonzero(slice_tensor).max() + 1]]
+        # new_message = out[slice_tensor[:torch.nonzero(slice_tensor).max() + 1]]
+        # updated_message = out[slice_tensor].clone()
 
-        max_diff = (new_message - self.message_map[slice_tensor]).abs().sum(1).max()
+        max_diff = (out[slice_tensor].detach() - self.message_map[slice_tensor].detach()).abs().sum(1).max()
         # update messages
-        self.message_map[slice_tensor] = new_message.clone()
+        self.message_map[slice_tensor] = out[slice_tensor]
         return max_diff
 
     def _update_message_create_slice(self, target_list):
@@ -255,7 +261,7 @@ class BeliefPropagation(nn.Module):
         slice_tensor = torch.zeros(self.message_map.shape[0], dtype=torch.uint8)
         # for torch_scatter
         index_tensor = torch.ones(self.message_map.shape[0], dtype=torch.long) * \
-                       (-1)  # -1: a trick ignore all redundant index
+                       self.message_map.shape[0]  # a trick solve "Invalid index in gather at", but redundant
 
         for src_node, dst_node in target_list:
             src_neighbors = list(self.G.neighbors(src_node))
@@ -276,7 +282,7 @@ class BeliefPropagation(nn.Module):
                 src_messages2 = [(k, src_node) for k in self.G.nodes() if k not in [src_node, dst_node]]
                 raise NotImplementedError()
 
-            assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(slice_tensor).max()
+            # assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(slice_tensor).max()
         # assert index_tensor.max() == torch.nonzero(slice_tensor).max()
         return slice_tensor, index_tensor
 
@@ -493,8 +499,8 @@ if __name__ == '__main__':
     adj = nx.to_scipy_sparse_matrix(g)
 
     bp = BeliefPropagation(4)
-    S, reg = bp(adj)
-    reg.backward(retain_graph=True)
+    assignment_matrix, reg, entropy_loss, modularity = bp(adj)
+    entropy_loss.backward(retain_graph=True)
 
     print("reg \t", reg)
     print("bp.beta.grad \t", bp.beta.grad)
