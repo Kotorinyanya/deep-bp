@@ -2,7 +2,9 @@ import concurrent.futures
 import logging
 import threading
 import time
-from random import shuffle
+from boxx import timeit
+import random
+from scipy.sparse import csr_matrix
 
 import networkx as nx
 import numpy as np
@@ -36,6 +38,8 @@ class BeliefPropagation(nn.Module):
         :param num_workers: multi-threading workers
         :param bp_type: 'approximate' with external field h, or 'exact'
         :param bp_implementation_type: 'parallel` with torch_scatter, or 'legacy'
+        :param parallel_min_iter: minimum number of iteration for BP approximation,
+                                few value means faster inference, large value means worse approximation
         :param seed:
         """
 
@@ -82,8 +86,9 @@ class BeliefPropagation(nn.Module):
         self.logger.info('beta initialized to {0}'.format(self.beta.data))
 
         # initialized later on calling forward
-        self.G, self.W, self.mean_w, self.N, self.mean_degree, self.message_index_list = None, None, None, None, None, None
-        self.marginal_psi, self.message_map, self.h, self.node_id_to_index, self.w_indexed = None, None, None, None, None
+        self.G, self.W, self.mean_w, self.N, self.mean_degree, self.message_index_set = None, None, None, None, None, None
+        self.marginal_psi, self.message_map, self.h, self.w_indexed = None, None, None, None
+        self.node_id_to_index, self.num_messages = None, None
         self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
         self.job_list, self._update_message_slice_and_index, self._update_psi_index = None, None, None
         self.is_init = False
@@ -128,49 +133,55 @@ class BeliefPropagation(nn.Module):
         :param adjacency_matrix:
         :return:
         """
-        self.G = nx.to_networkx_graph(adjacency_matrix)
-        if self.is_init is True:
-            if not csr_matrix_equal(nx.to_scipy_sparse_matrix(self.G).astype(np.float), self.W):  # check not equal
-                # if the input adjacency_matrix changes, job_list need to be re initialized
-                self.is_init = False
-        self.W = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
-        self.mean_w = self.W.mean()
-        self.N = self.G.number_of_nodes()
-        self.mean_degree = torch.tensor(self.W.mean() * self.N, device=self.beta.device)
-        self.message_index_list = list(self.G.to_directed().edges())
-
-        # seed for stable gradient descent
+        # seed for a stable gradient descent
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
-        # initialize by random psi
-        marginal_psi = torch.rand(self.N, self.num_groups,
-                                  device=self.beta.device)  # the marginal probability of node i
-
-        self.marginal_psi = marginal_psi / marginal_psi.sum(1).reshape(-1, 1)
-        if self.bp_implementation_type == 'legacy':
-            self.message_map = self.init_messages()  # messages (bi-edges)
-        elif self.bp_implementation_type == 'parallel':
-            self.message_map, self.node_id_to_index, self.w_indexed = self.init_messages()
-        # initialize external field
-        self.h = (-self.beta * self.mean_w * self.marginal_psi.clone()).sum(0)
-
+        self.logger.info("Initializing BP")
+        # with timeit(name="Initialize BP"):
+        if self.is_init:
+            if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.W):
+                # if the input adjacency_matrix changes, job_list need to be re initialized
+                self.is_init = False
         if not self.is_init:
+            self.G = nx.to_networkx_graph(adjacency_matrix)
+            self.W = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
+            self.mean_w = self.W.mean()
+            self.N = self.G.number_of_nodes()
+            self.mean_degree = torch.tensor(self.W.mean() * self.N, device=self.beta.device)
+            self.message_index_set = set(self.G.to_directed().edges())  # set is way more faster than list
+            self.num_messages = len(self.message_index_set)
+
+            if self.bp_implementation_type == 'parallel':
+                self.node_id_to_index, self.w_indexed = self.init_node_w()
+
             if self.bp_implementation_type == 'legacy':
                 # multi-thread synchronization using lock
                 self._lock_psi = [threading.Lock() for _ in range(len(self.marginal_psi))]
                 self._lock_mmap = [[threading.Lock() for _ in range(len(mmap))] for mmap in self.message_map]
                 self._lock_h = threading.Lock()
             elif self.bp_implementation_type == 'parallel':
-                # job_list to avoid race
-                # job -> (edges, nodes)
-                self.job_list = self._create_job_list_parallel()
-                self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
-                                                        for job in self.job_list]
-                self._update_psi_index = [self._update_psi_create_index(job[1])
-                                          for job in self.job_list]
-
+                self.logger.info("Initializing Job List")
+                with timeit(name="Initialize Job List"):
+                    # job_list to avoid race, job -> (edges, nodes)
+                    self.job_list = self._create_job_list_parallel()
+                self.logger.info("Creating slice and index")
+                with timeit(name="Create slice and index"):
+                    self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
+                                                            for job in self.job_list]
+                    self._update_psi_index = [self._update_psi_create_index(job[1])
+                                              for job in self.job_list]
             self.is_init = True
+
+        self.logger.info("Initializing Messages")
+        # with timeit(name="Initialize Messages"):
+        # initialize by random psi
+        marginal_psi = torch.rand(self.N, self.num_groups,
+                                  device=self.beta.device)  # the marginal probability of node i
+        self.marginal_psi = marginal_psi / marginal_psi.sum(1).reshape(-1, 1)
+        self.message_map = self.init_messages()  # messages (bi-edges)
+        # initialize external field
+        self.h = (-self.beta * self.mean_w * self.marginal_psi.clone()).sum(0)
 
     def bp_infer_parallel(self):
         """
@@ -226,9 +237,9 @@ class BeliefPropagation(nn.Module):
         # for updating marginal_psi
         write_nodes_slice_tensor = torch.zeros(self.N, dtype=torch.uint8, device=self.beta.device)
         # for reading messages
-        read_message_slice_tensor = torch.zeros(self.message_map.shape[0], dtype=torch.uint8, device=self.beta.device)
+        read_message_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
         # for torch_scatter
-        index_tensor = torch.ones(self.message_map.shape[0], dtype=torch.long, device=self.beta.device) * \
+        index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
                        (-1)  # a trick
         for dst_node in nodes:
             write_nodes_slice_tensor[dst_node] = 1  # mark message to write
@@ -251,7 +262,7 @@ class BeliefPropagation(nn.Module):
         # sum all messages
         src = 1 + self.message_map[read_messages_slice_tensor].clone() * \
               (torch.exp(self.beta * self.w_indexed[read_messages_slice_tensor]) - 1)
-        out = self.message_map.new_ones((self.message_map.shape[0], self.message_map.shape[1]))
+        out = self.message_map.new_ones((self.num_messages, self.message_map.shape[1]))
         out = scatter_mul(src, index_tensor, out=out, dim=0)
         out = out[write_messages_slice_tensor]
         out = out * torch.exp(self.h)
@@ -266,11 +277,11 @@ class BeliefPropagation(nn.Module):
 
     def _update_message_create_slice(self, target_list):
         # for updating message_map
-        write_messages_slice_tensor = torch.zeros(self.message_map.shape[0], dtype=torch.uint8, device=self.beta.device)
+        write_messages_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
         # for reading message_map
-        read_messages_slice_tensor = torch.zeros(self.message_map.shape[0], dtype=torch.uint8, device=self.beta.device)
+        read_messages_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
         # for torch_scatter
-        index_tensor = torch.ones(self.message_map.shape[0], dtype=torch.long, device=self.beta.device) * \
+        index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
                        (-1)  # a trick
         for src_node, dst_node in target_list:
             src_neighbors = list(self.G.neighbors(src_node))
@@ -298,29 +309,26 @@ class BeliefPropagation(nn.Module):
         return write_messages_slice_tensor, read_messages_slice_tensor, index_tensor
 
     def _create_job_list_parallel(self):
-        np.random.seed(self.seed)
-
-        todo_list = self.message_index_list
-        np.random.shuffle(todo_list)
-
+        random.seed(self.seed)
+        todo_set = self.message_index_set
         job_list = []
-        while len(todo_list) > 0:
-            writing, reading = [], []
-            for e in todo_list:
-                if e in reading:
+        while len(todo_set) > 0:
+            writing, reading = set(), set()
+            for i_to_j in todo_set:
+                if i_to_j in reading:
                     continue
-                i, j = e
+                i, j = i_to_j
                 if self.bp_type == 'approximate':
-                    to_read = [(k, i) for k in self.G.neighbors(i) if k != j]
+                    to_read = set((k, i) for k in self.G.neighbors(i) if k != j)
                 elif self.bp_type == 'exact':
-                    to_read = [(k, i) for k in self.G.nodes() if k not in [i, j]]
+                    to_read = set((k, i) for k in self.G.nodes() if k not in [i, j])
                 if common_member(to_read, writing):
                     continue
-                writing.append(e)
-                reading += to_read
-                if len(writing) > self.message_map.shape[0] / self.parallel_min_iter:
+                writing.add(i_to_j)
+                reading |= to_read
+                if len(writing) > self.num_messages / self.parallel_min_iter:
                     break
-            todo_list = [e for e in todo_list if e not in writing]
+            todo_set = set(e for e in todo_set if e not in writing)
 
             # append_list = self.message_index_list
             # np.random.shuffle(append_list)
@@ -365,7 +373,7 @@ class BeliefPropagation(nn.Module):
                     max_diff = diff if diff > max_diff else max_diff
             end = time.time()
             self.logger.info(
-                "num_iter \t {:3d} \t time \t {:.2f} \t max_diff {}".format(num_iter, end - start, max_diff))
+                "num_iter \t {:3d} \t time \t {:.2f}ms \t max_diff {}".format(num_iter, (end - start) * 1000, max_diff))
 
             if max_diff < self.bp_max_diff:
                 return num_iter, max_diff
@@ -442,33 +450,34 @@ class BeliefPropagation(nn.Module):
         return marginal_psi_i
 
     def init_messages(self):
-
         if self.bp_implementation_type == 'legacy':
             message_map = []
             for i in self.G.nodes():
                 message_map_at_i = torch.rand(len(list(self.G.neighbors(i))), self.num_groups, device=self.beta.device)
                 message_map_at_i = message_map_at_i / message_map_at_i.sum(1).reshape(-1, 1)
                 message_map.append(message_map_at_i)
-            return message_map
-
         elif self.bp_implementation_type == 'parallel':
-            node_id_to_index = dict()
-            sum_index = 0
-            for i in self.G.nodes():
-                node_id_to_index[i] = sum_index
-                sum_index += len(list(self.G.neighbors(i)))
-            num_messages = len(list(self.G.to_directed().edges()))
-
-            message_map = torch.rand(num_messages, self.num_groups, device=self.beta.device)
+            message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
             message_map = message_map / message_map.sum(1).reshape(-1, 1)
 
-            w_indexed = torch.zeros(num_messages, device=self.beta.device)
-            for i in self.G.nodes():
-                for j in self.G.neighbors(i):
-                    j_th_neibor = list(self.G.neighbors(i)).index(j)
-                    w_indexed[node_id_to_index[i] + j_th_neibor] = self.W[i, j]
+        return message_map
 
-            return message_map, node_id_to_index, w_indexed.reshape(-1, 1)
+    def init_node_w(self):
+        node_id_to_index = dict()
+        sum_index = 0
+        for i in self.G.nodes():
+            node_id_to_index[i] = sum_index
+            sum_index += len(list(self.G.neighbors(i)))
+
+        w_indexed = torch.zeros(self.num_messages, device=self.beta.device)
+        for i in self.G.nodes():
+            i_neighbors = list(self.G.neighbors(i))
+            for index, j in enumerate(self.G.neighbors(i)):
+                i_to_j_index = node_id_to_index[i] + index
+                w_indexed[i_to_j_index] = self.W[i, j]
+        w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
+
+        return node_id_to_index, w_indexed
 
     def compute_modularity(self):
         """
@@ -512,15 +521,16 @@ class BeliefPropagation(nn.Module):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
 
-    sizes = [50, 50, 50, 50]
-    P = np.ones((4, 4)) * 0.006
+    num_groups = 2
+    sizes = [500] * num_groups
+    P = np.ones((num_groups, num_groups)) * 0.005
     for i in range(len(P)):
-        P[i][i] = P[i][i] * 10
+        P[i][i] = P[i][i] * 5
     g = nx.stochastic_block_model(sizes, P)
     adj = nx.to_scipy_sparse_matrix(g)
 
-    bp = BeliefPropagation(4)
-    bp = bp.to('cuda:7')
+    bp = BeliefPropagation(num_groups)
+    # bp = bp.to('cuda:7')
     assignment_matrix, reg, entropy_loss, modularity = bp(adj)
     entropy_loss.backward(retain_graph=True)
 
