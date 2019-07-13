@@ -121,27 +121,25 @@ class BeliefPropagation(nn.Module):
         self.logger.info("BP STATUS: max_diff \t {0:.5f} \t modularity \t {1}".format(max_diff, modularity))
         if self.writer is not None:
             self.writer.add_scalar("beta", self.beta.item(), self.global_step)
-            if self.global_step > 0:
+            if self.global_step > 0:  # at step 0, gradient is not computed
                 self.writer.add_scalar("beta_grad", self.beta.grad.item(), self.global_step)
             self.writer.add_scalar("num_iter", num_iter, self.global_step)
             self.writer.add_scalar("max_diff", max_diff, self.global_step)
             if self.bp_implementation_type == 'parallel':
                 if self.histogram_dim == 1:
-                    with timeit(name="writer [:, i]"):
-                        for i in range(self.num_groups):
-                            self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
-                                                      self.global_step)
-                            self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
-                                                      self.global_step)
+                    for i in range(self.num_groups):
+                        self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
+                                                  self.global_step)
+                        self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
+                                                  self.global_step)
                 elif self.histogram_dim == 0:
-                    with timeit(name="writer [i, :]"):
-                        for e in range(self.num_messages):
-                            i, j = self.message_index_list[e]
-                            self.writer.add_histogram("message_{}_to_{}".format(i, j), self.message_map[e, :].flatten(),
-                                                      self.global_step)
-                        for n in range(self.num_nodes):
-                            self.writer.add_histogram("psi_{}".format(n), self.marginal_psi[n, :].flatten(),
-                                                      self.global_step)
+                    for e in range(self.num_messages):
+                        i, j = self.message_index_list[e]
+                        self.writer.add_histogram("message_{}_to_{}".format(i, j), self.message_map[e, :].flatten(),
+                                                  self.global_step)
+                    for n in range(self.num_nodes):
+                        self.writer.add_histogram("psi_{}".format(n), self.marginal_psi[n, :].flatten(),
+                                                  self.global_step)
             self.global_step += 1
         if not is_converge:
             self.logger.warning(
@@ -176,7 +174,7 @@ class BeliefPropagation(nn.Module):
             self.adjacency_matrix = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
             self.mean_w = self.adjacency_matrix.mean()
             self.num_nodes = self.G.number_of_nodes()
-            self.mean_degree = torch.tensor(self.adjacency_matrix.mean() * self.num_nodes, device=self.beta.device)
+            self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
             self.message_index_list = list(self.G.to_directed().edges())  # set is way more faster than list
             self.num_messages = len(self.message_index_list)
 
@@ -506,41 +504,6 @@ class BeliefPropagation(nn.Module):
         w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
 
         return node_id_to_index, w_indexed
-
-    # TODO: move to new file
-    def compute_modularity(self):
-        """
-        This modularity can't be used with auto_grad as assignment (line 2) is disperse.
-        :return:
-        """
-        m = self.G.number_of_edges()
-        _, assignment = torch.max(self.marginal_psi, 1)
-
-        modularity = torch.tensor([0], dtype=torch.float, device=self.beta.device)
-        for i, j in self.G.edges():
-            delta = 1 if assignment[i] == assignment[j] else 0
-            modularity = modularity + self.adjacency_matrix[i, j] * delta - self.mean_w * delta
-        modularity = modularity / m
-        return modularity
-
-    def compute_reg(self):
-        """
-        continues version of negative modularity (with positive value)
-        :return:
-        """
-        m = self.G.number_of_edges()
-        reg = torch.tensor([0], dtype=torch.float, device=self.beta.device)
-        for i, j in self.G.edges():
-            reg += self.adjacency_matrix[i, j] * torch.pow((self.marginal_psi[i] - self.marginal_psi[j]), 2).sum()
-        reg = reg / m
-        return reg
-
-    def compute_free_energy(self):
-        """
-        Q: is free_energy required as an output ?
-        :return:
-        """
-        pass
 
     def __repr__(self):
         return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
