@@ -20,19 +20,22 @@ class BeliefPropagation(nn.Module):
                  num_groups,
                  mean_degree=None,
                  max_num_iter=50,
-                 bp_max_diff=5e-2,
+                 bp_max_diff=1e-2,
                  bp_dumping_rate=1.0,
                  num_workers=1,
                  bp_type='approximate',
                  bp_implementation_type='parallel',
                  parallel_min_iter=100,
+                 summary_writer=None,
+                 histogram_dim=1,
                  seed=0):
         """
         Belief Propagation for pooling on graphs
 
         :param num_groups: pooling size
         :param mean_degree: not required, but highly recommend
-        :param max_num_iter: max BP iteration to converge
+        :param max_num_iter: max BP iteration to converge,
+                            NOTE: large number of iteration blows up RAM
         :param bp_max_diff: max BP diff to converge
         :param bp_dumping_rate: BP dumping rate, 1.0 as default
         :param num_workers: multi-threading workers
@@ -40,6 +43,8 @@ class BeliefPropagation(nn.Module):
         :param bp_implementation_type: 'parallel` with torch_scatter, or 'legacy'
         :param parallel_min_iter: minimum number of iteration for BP approximation,
                                 few value means faster inference, large value means worse approximation
+        :param summary_writer: TensorBoardX
+        :param histogram_dim: 1 is fast, 0 is extremely slow but detailed
         :param seed:
         """
 
@@ -55,6 +60,8 @@ class BeliefPropagation(nn.Module):
         self.parallel_min_iter = parallel_min_iter
         self.seed = seed
         self.logger = logging.getLogger(str(self.__class__.__name__))
+        self.writer = summary_writer
+        self.histogram_dim = histogram_dim
         self.num_workers = num_workers
         self.bp_dumping_rate = bp_dumping_rate
         self.bp_max_diff = bp_max_diff  # max_diff = max_diff / num_groups ?
@@ -86,12 +93,12 @@ class BeliefPropagation(nn.Module):
         self.logger.info('beta initialized to {0}'.format(self.beta.data))
 
         # initialized later on calling forward
-        self.G, self.W, self.mean_w, self.N, self.mean_degree, self.message_index_set = None, None, None, None, None, None
-        self.marginal_psi, self.message_map, self.h, self.w_indexed = None, None, None, None
+        self.G, self.adjacency_matrix, self.mean_w, self.num_nodes, self.mean_degree = None, None, None, None, None
+        self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
         self.node_id_to_index, self.num_messages = None, None
         self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
         self.job_list, self._update_message_slice_and_index, self._update_psi_index = None, None, None
-        self.is_init = False
+        self.is_init, self.global_step = False, 0
 
         # constrain add to modularity regularization
         self.entropy_loss = EntropyLoss()
@@ -102,18 +109,40 @@ class BeliefPropagation(nn.Module):
             num_iter, max_diff = self.bp_infer_parallel()
         elif self.bp_implementation_type == 'legacy':
             num_iter, max_diff = self.bp_infer_legacy()
-        # num_iter, max_diff = self.bp_infer()
         is_converge = True if max_diff < self.bp_max_diff else False
         assignment_matrix = self.marginal_psi  # weighted
-        # _, assignment = torch.max(self.marginal_psi, 1)  # unweighted
         modularity = self.compute_modularity()
         reg = self.compute_reg() * np.sqrt(self.num_groups)
         entropy_loss = self.entropy_loss(self.marginal_psi) / np.log(self.num_groups)
-        # or * self.mean_degree * self.mean_degree / self.num_groups
 
+        # logging
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
         self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1}".format(is_converge, num_iter))
         self.logger.info("BP STATUS: max_diff \t {0:.5f} \t modularity \t {1}".format(max_diff, modularity))
+        if self.writer is not None:
+            self.writer.add_scalar("beta", self.beta.item(), self.global_step)
+            if self.global_step > 0:
+                self.writer.add_scalar("beta_grad", self.beta.grad.item(), self.global_step)
+            self.writer.add_scalar("num_iter", num_iter, self.global_step)
+            self.writer.add_scalar("max_diff", max_diff, self.global_step)
+            if self.bp_implementation_type == 'parallel':
+                if self.histogram_dim == 1:
+                    with timeit(name="writer [:, i]"):
+                        for i in range(self.num_groups):
+                            self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
+                                                      self.global_step)
+                            self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
+                                                      self.global_step)
+                elif self.histogram_dim == 0:
+                    with timeit(name="writer [i, :]"):
+                        for e in range(self.num_messages):
+                            i, j = self.message_index_list[e]
+                            self.writer.add_histogram("message_{}_to_{}".format(i, j), self.message_map[e, :].flatten(),
+                                                      self.global_step)
+                        for n in range(self.num_nodes):
+                            self.writer.add_histogram("psi_{}".format(n), self.marginal_psi[n, :].flatten(),
+                                                      self.global_step)
+            self.global_step += 1
         if not is_converge:
             self.logger.warning(
                 "SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2}. "
@@ -137,20 +166,19 @@ class BeliefPropagation(nn.Module):
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
-        self.logger.info("Initializing BP")
-        # with timeit(name="Initialize BP"):
         if self.is_init:
-            if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.W):
+            if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.adjacency_matrix):
                 # if the input adjacency_matrix changes, job_list need to be re initialized
                 self.is_init = False
         if not self.is_init:
+            self.logger.info("Initializing BP")
             self.G = nx.to_networkx_graph(adjacency_matrix)
-            self.W = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
-            self.mean_w = self.W.mean()
-            self.N = self.G.number_of_nodes()
-            self.mean_degree = torch.tensor(self.W.mean() * self.N, device=self.beta.device)
-            self.message_index_set = set(self.G.to_directed().edges())  # set is way more faster than list
-            self.num_messages = len(self.message_index_set)
+            self.adjacency_matrix = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
+            self.mean_w = self.adjacency_matrix.mean()
+            self.num_nodes = self.G.number_of_nodes()
+            self.mean_degree = torch.tensor(self.adjacency_matrix.mean() * self.num_nodes, device=self.beta.device)
+            self.message_index_list = list(self.G.to_directed().edges())  # set is way more faster than list
+            self.num_messages = len(self.message_index_list)
 
             if self.bp_implementation_type == 'parallel':
                 self.node_id_to_index, self.w_indexed = self.init_node_w()
@@ -176,7 +204,7 @@ class BeliefPropagation(nn.Module):
         self.logger.info("Initializing Messages")
         # with timeit(name="Initialize Messages"):
         # initialize by random psi
-        marginal_psi = torch.rand(self.N, self.num_groups,
+        marginal_psi = torch.rand(self.num_nodes, self.num_groups,
                                   device=self.beta.device)  # the marginal probability of node i
         self.marginal_psi = marginal_psi / marginal_psi.sum(1).reshape(-1, 1)
         self.message_map = self.init_messages()  # messages (bi-edges)
@@ -235,7 +263,7 @@ class BeliefPropagation(nn.Module):
 
     def _update_psi_create_index(self, nodes):
         # for updating marginal_psi
-        write_nodes_slice_tensor = torch.zeros(self.N, dtype=torch.uint8, device=self.beta.device)
+        write_nodes_slice_tensor = torch.zeros(self.num_nodes, dtype=torch.uint8, device=self.beta.device)
         # for reading messages
         read_message_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
         # for torch_scatter
@@ -310,7 +338,7 @@ class BeliefPropagation(nn.Module):
 
     def _create_job_list_parallel(self):
         random.seed(self.seed)
-        todo_set = self.message_index_set
+        todo_set = set(self.message_index_list)  # set is faster than list to do subtraction
         job_list = []
         while len(todo_set) > 0:
             writing, reading = set(), set()
@@ -426,7 +454,7 @@ class BeliefPropagation(nn.Module):
                 k_to_i = list(self.G.neighbors(k)).index(i)
                 #             print(i, i_to_k, k, k_to_i)
                 this_value *= (1 + self.message_map[k][k_to_i][q].clone() *
-                               (torch.exp(self.beta * self.W[i, k]) - 1))
+                               (torch.exp(self.beta * self.adjacency_matrix[i, k]) - 1))
             this_value *= torch.exp(self.h[q])
             message_i_to_j[q] = this_value
         message_i_to_j = message_i_to_j.clone() / message_i_to_j.clone().sum()
@@ -442,7 +470,7 @@ class BeliefPropagation(nn.Module):
             for j in neighbors:
                 j_to_i = list(self.G.neighbors(j)).index(i)
                 this_value *= (1 + self.message_map[j][j_to_i][q].clone() *
-                               (torch.exp(self.beta * self.W[i, j]) - 1))
+                               (torch.exp(self.beta * self.adjacency_matrix[i, j]) - 1))
             this_value *= torch.exp(self.h[q])
             marginal_psi_i[q] = this_value
         marginal_psi_i = marginal_psi_i.clone() / marginal_psi_i.clone().clone().sum()
@@ -474,11 +502,12 @@ class BeliefPropagation(nn.Module):
             i_neighbors = list(self.G.neighbors(i))
             for index, j in enumerate(self.G.neighbors(i)):
                 i_to_j_index = node_id_to_index[i] + index
-                w_indexed[i_to_j_index] = self.W[i, j]
+                w_indexed[i_to_j_index] = self.adjacency_matrix[i, j]
         w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
 
         return node_id_to_index, w_indexed
 
+    # TODO: move to new file
     def compute_modularity(self):
         """
         This modularity can't be used with auto_grad as assignment (line 2) is disperse.
@@ -490,7 +519,7 @@ class BeliefPropagation(nn.Module):
         modularity = torch.tensor([0], dtype=torch.float, device=self.beta.device)
         for i, j in self.G.edges():
             delta = 1 if assignment[i] == assignment[j] else 0
-            modularity = modularity + self.W[i, j] * delta - self.mean_w * delta
+            modularity = modularity + self.adjacency_matrix[i, j] * delta - self.mean_w * delta
         modularity = modularity / m
         return modularity
 
@@ -502,7 +531,7 @@ class BeliefPropagation(nn.Module):
         m = self.G.number_of_edges()
         reg = torch.tensor([0], dtype=torch.float, device=self.beta.device)
         for i, j in self.G.edges():
-            reg += self.W[i, j] * torch.pow((self.marginal_psi[i] - self.marginal_psi[j]), 2).sum()
+            reg += self.adjacency_matrix[i, j] * torch.pow((self.marginal_psi[i] - self.marginal_psi[j]), 2).sum()
         reg = reg / m
         return reg
 
