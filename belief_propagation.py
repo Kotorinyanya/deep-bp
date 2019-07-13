@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from utils import *
+from bp_helper import _create_job_list_parallel
 
 
 class BeliefPropagation(nn.Module):
@@ -19,10 +20,12 @@ class BeliefPropagation(nn.Module):
     def __init__(self,
                  num_groups,
                  mean_degree=None,
-                 max_num_iter=50,
-                 bp_max_diff=1e-2,
+                 max_num_iter=100,
+                 bp_max_diff=1e-5,
                  bp_dumping_rate=1.0,
                  num_workers=1,
+                 is_logging=True,
+                 verbose=False,
                  bp_type='approximate',
                  bp_implementation_type='parallel',
                  parallel_min_iter=100,
@@ -38,7 +41,9 @@ class BeliefPropagation(nn.Module):
                             NOTE: large number of iteration blows up RAM
         :param bp_max_diff: max BP diff to converge
         :param bp_dumping_rate: BP dumping rate, 1.0 as default
-        :param num_workers: multi-threading workers
+        :param verbose: logging level
+        :param num_workers: multi-threading workers (for legacy)
+        :param is_logging: if logging
         :param bp_type: 'approximate' with external field h, or 'exact'
         :param bp_implementation_type: 'parallel` with torch_scatter, or 'legacy'
         :param parallel_min_iter: minimum number of iteration for BP approximation,
@@ -59,7 +64,10 @@ class BeliefPropagation(nn.Module):
         self.bp_implementation_type = bp_implementation_type
         self.parallel_min_iter = parallel_min_iter
         self.seed = seed
+        self.is_logging = is_logging
         self.logger = logging.getLogger(str(self.__class__.__name__))
+        if verbose:
+            logging.basicConfig(level=logging.INFO)
         self.writer = summary_writer
         self.histogram_dim = histogram_dim
         self.num_workers = num_workers
@@ -100,25 +108,34 @@ class BeliefPropagation(nn.Module):
         self.job_list, self._update_message_slice_and_index, self._update_psi_index = None, None, None
         self.is_init, self.global_step = False, 0
 
-        # constrain add to modularity regularization
-        self.entropy_loss = EntropyLoss()
-
     def forward(self, adjacency_matrix):
-        self.init_bp(adjacency_matrix)
-        if self.bp_implementation_type == 'parallel':
-            num_iter, max_diff = self.bp_infer_parallel()
-        elif self.bp_implementation_type == 'legacy':
-            num_iter, max_diff = self.bp_infer_legacy()
-        is_converge = True if max_diff < self.bp_max_diff else False
-        assignment_matrix = self.marginal_psi  # weighted
-        modularity = self.compute_modularity()
-        reg = self.compute_reg() * np.sqrt(self.num_groups)
-        entropy_loss = self.entropy_loss(self.marginal_psi) / np.log(self.num_groups)
+        """
 
-        # logging
+        :param adjacency_matrix: csr_matrix, or numpy array
+        :return:
+        """
+        self.init_bp(adjacency_matrix)
+
+        with timeit(name="parallel_min_iter={0}".format(self.parallel_min_iter)):
+            if self.bp_implementation_type == 'parallel':
+                num_iter, max_diff = self.bp_infer_parallel()
+            elif self.bp_implementation_type == 'legacy':
+                num_iter, max_diff = self.bp_infer_legacy()
+
+        if self.is_logging:
+            self.bp_logging(num_iter, max_diff)
+
+        if (self.beta < 0.05).sum() > 0:
+            raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP (which is not good), "
+                            "please consider adding the weight for entropy_loss".format(self.beta.data))
+
+        return self.message_map, self.marginal_psi, self.message_index_list
+
+    def bp_logging(self, num_iter, max_diff):
+        is_converged = True if max_diff < self.bp_max_diff else False
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
-        self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1}".format(is_converge, num_iter))
-        self.logger.info("BP STATUS: max_diff \t {0:.5f} \t modularity \t {1}".format(max_diff, modularity))
+        self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1} \t max_diff \t {2:.5f}"
+                         .format(is_converged, num_iter, max_diff))
         if self.writer is not None:
             self.writer.add_scalar("beta", self.beta.item(), self.global_step)
             if self.global_step > 0:  # at step 0, gradient is not computed
@@ -141,7 +158,7 @@ class BeliefPropagation(nn.Module):
                         self.writer.add_histogram("psi_{}".format(n), self.marginal_psi[n, :].flatten(),
                                                   self.global_step)
             self.global_step += 1
-        if not is_converge:
+        if not is_converged:
             self.logger.warning(
                 "SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2}. "
                 "Indicating a spin-glass (SG) phase in BP".format(
@@ -149,10 +166,6 @@ class BeliefPropagation(nn.Module):
         if (self.beta < 0.05).sum() > 0:
             self.logger.critical("P:beta={0}, indicating paramagnetic phase in BP (which is not good), "
                                  "please consider adding the weight for entropy_loss".format(self.beta.data))
-            raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP (which is not good), "
-                            "please consider adding the weight for entropy_loss".format(self.beta.data))
-
-        return assignment_matrix, reg, entropy_loss, modularity
 
     def init_bp(self, adjacency_matrix):
         """
@@ -190,7 +203,8 @@ class BeliefPropagation(nn.Module):
                 self.logger.info("Initializing Job List")
                 with timeit(name="Initialize Job List"):
                     # job_list to avoid race, job -> (edges, nodes)
-                    self.job_list = self._create_job_list_parallel()
+                    self.job_list = _create_job_list_parallel(self.G, self.message_index_list, self.seed,
+                                                              self.bp_type, self.is_logging, self.logger)
                 self.logger.info("Creating slice and index")
                 with timeit(name="Create slice and index"):
                     self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
@@ -267,6 +281,8 @@ class BeliefPropagation(nn.Module):
         # for torch_scatter
         index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
                        (-1)  # a trick
+
+        # O(nk) time
         for dst_node in nodes:
             write_nodes_slice_tensor[dst_node] = 1  # mark message to write
             neighbors = list(self.G.neighbors(dst_node))
@@ -309,6 +325,8 @@ class BeliefPropagation(nn.Module):
         # for torch_scatter
         index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
                        (-1)  # a trick
+
+        # O(mk) time
         for src_node, dst_node in target_list:
             src_neighbors = list(self.G.neighbors(src_node))
             src_to_dst_message_index = self.node_id_to_index[src_node] + src_neighbors.index(dst_node)
@@ -333,50 +351,6 @@ class BeliefPropagation(nn.Module):
         #     pass
         index_tensor = index_tensor[index_tensor != -1]
         return write_messages_slice_tensor, read_messages_slice_tensor, index_tensor
-
-    def _create_job_list_parallel(self):
-        random.seed(self.seed)
-        todo_set = set(self.message_index_list)  # set is faster than list to do subtraction
-        job_list = []
-        while len(todo_set) > 0:
-            writing, reading = set(), set()
-            for i_to_j in todo_set:
-                if i_to_j in reading:
-                    continue
-                i, j = i_to_j
-                if self.bp_type == 'approximate':
-                    to_read = set((k, i) for k in self.G.neighbors(i) if k != j)
-                elif self.bp_type == 'exact':
-                    to_read = set((k, i) for k in self.G.nodes() if k not in [i, j])
-                if common_member(to_read, writing):
-                    continue
-                writing.add(i_to_j)
-                reading |= to_read
-                if len(writing) > self.num_messages / self.parallel_min_iter:
-                    break
-            todo_set = set(e for e in todo_set if e not in writing)
-
-            # append_list = self.message_index_list
-            # np.random.shuffle(append_list)
-            # for e in append_list:
-            #     if e in reading + writing:
-            #         continue
-            #     i, j = e
-            #     if self.bp_type == 'approximate':
-            #         to_read = [(k, i) for k in self.G.neighbors(i) if k != j]
-            #     elif self.bp_type == 'exact':
-            #         to_read = [(k, i) for k in self.G.nodes() if k not in [i, j]]
-            #     if common_member(to_read, writing):
-            #         continue
-            #     writing.append(e)
-            #     reading += to_read
-
-            job_list.append(writing)
-        for index, lst in enumerate(job_list):
-            edges = lst
-            nodes = list(set([edge[-1] for edge in edges]))
-            job_list[index] = (edges, nodes)
-        return job_list
 
     def bp_infer_legacy(self):
         """
@@ -513,19 +487,18 @@ class BeliefPropagation(nn.Module):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
 
-    num_groups = 2
-    sizes = [500] * num_groups
-    P = np.ones((num_groups, num_groups)) * 0.005
+    num_groups = 4
+    sizes = [100] * num_groups
+    P = np.ones((num_groups, num_groups)) * 0.05
     for i in range(len(P)):
         P[i][i] = P[i][i] * 5
-    g = nx.stochastic_block_model(sizes, P)
+    g = nx.stochastic_block_model(sizes, P, seed=0)
     adj = nx.to_scipy_sparse_matrix(g)
-
-    bp = BeliefPropagation(num_groups)
-    # bp = bp.to('cuda:7')
-    assignment_matrix, reg, entropy_loss, modularity = bp(adj)
-    entropy_loss.backward(retain_graph=True)
-
-    print("reg \t", reg)
-    print("bp.beta.grad \t", bp.beta.grad)
-    print()
+    mean_degree = adj.mean() * g.number_of_nodes()
+    for parallel_min_iter in range(50, 300, 50):
+        bp = BeliefPropagation(num_groups, parallel_min_iter=parallel_min_iter)
+        entropy = EntropyLoss()
+        # bp = bp.cuda()
+        message_map, marginal_psi, message_index_list = bp(adj)
+        entropy_loss = entropy(marginal_psi)
+        entropy_loss.backward(retain_graph=True)
