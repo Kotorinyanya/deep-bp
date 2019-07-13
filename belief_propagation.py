@@ -10,6 +10,8 @@ import networkx as nx
 import numpy as np
 import torch
 from torch import nn
+from tqdm import tqdm
+from multiprocessing import Pool
 
 from utils import *
 from bp_helper import _create_job_list_parallel
@@ -28,7 +30,7 @@ class BeliefPropagation(nn.Module):
                  verbose=False,
                  bp_type='approximate',
                  bp_implementation_type='parallel',
-                 parallel_min_iter=100,
+                 parallel_max_edges=1000,
                  summary_writer=None,
                  histogram_dim=1,
                  seed=0):
@@ -46,7 +48,7 @@ class BeliefPropagation(nn.Module):
         :param is_logging: if logging
         :param bp_type: 'approximate' with external field h, or 'exact'
         :param bp_implementation_type: 'parallel` with torch_scatter, or 'legacy'
-        :param parallel_min_iter: minimum number of iteration for BP approximation,
+        :param parallel_max_edges: minimum number of iteration for BP approximation,
                                 few value means faster inference, large value means worse approximation
         :param summary_writer: TensorBoardX
         :param histogram_dim: 1 is fast, 0 is extremely slow but detailed
@@ -62,7 +64,7 @@ class BeliefPropagation(nn.Module):
 
         self.bp_type = bp_type
         self.bp_implementation_type = bp_implementation_type
-        self.parallel_min_iter = parallel_min_iter
+        self.parallel_max_edges = parallel_max_edges
         self.seed = seed
         self.is_logging = is_logging
         self.logger = logging.getLogger(str(self.__class__.__name__))
@@ -105,7 +107,7 @@ class BeliefPropagation(nn.Module):
         self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
         self.node_id_to_index, self.num_messages = None, None
         self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
-        self.job_list, self._update_message_slice_and_index, self._update_psi_index = None, None, None
+        self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
         self.is_init, self.global_step = False, 0
 
     def forward(self, adjacency_matrix):
@@ -116,11 +118,10 @@ class BeliefPropagation(nn.Module):
         """
         self.init_bp(adjacency_matrix)
 
-        with timeit(name="parallel_min_iter={0}".format(self.parallel_min_iter)):
-            if self.bp_implementation_type == 'parallel':
-                num_iter, max_diff = self.bp_infer_parallel()
-            elif self.bp_implementation_type == 'legacy':
-                num_iter, max_diff = self.bp_infer_legacy()
+        if self.bp_implementation_type == 'parallel':
+            num_iter, max_diff = self.bp_infer_parallel()
+        elif self.bp_implementation_type == 'legacy':
+            num_iter, max_diff = self.bp_infer_legacy()
 
         if self.is_logging:
             self.bp_logging(num_iter, max_diff)
@@ -192,6 +193,7 @@ class BeliefPropagation(nn.Module):
             self.num_messages = len(self.message_index_list)
 
             if self.bp_implementation_type == 'parallel':
+                self.logger.info("Initializing indexes")
                 self.node_id_to_index, self.w_indexed = self.init_node_w()
 
             if self.bp_implementation_type == 'legacy':
@@ -201,16 +203,21 @@ class BeliefPropagation(nn.Module):
                 self._lock_h = threading.Lock()
             elif self.bp_implementation_type == 'parallel':
                 self.logger.info("Initializing Job List")
-                with timeit(name="Initialize Job List"):
-                    # job_list to avoid race, job -> (edges, nodes)
-                    self.job_list = _create_job_list_parallel(self.G, self.message_index_list, self.seed,
-                                                              self.bp_type, self.is_logging, self.logger)
+                # job_list to avoid race, job -> (edges, nodes)
+                self.job_list = _create_job_list_parallel(
+                    self.G, self.message_index_list,
+                    self.parallel_max_edges / self.mean_degree,  # need to be proved
+                    self.seed, self.bp_type, self.is_logging
+                )
                 self.logger.info("Creating slice and index")
-                with timeit(name="Create slice and index"):
-                    self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
-                                                            for job in self.job_list]
-                    self._update_psi_index = [self._update_psi_create_index(job[1])
-                                              for job in self.job_list]
+                # self._update_message_slice_and_index, self._update_psi_slice_and_index = \
+                #     self.create_slice_and_index_mp()
+                self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
+                                                        for job in (tqdm(self.job_list, desc="create message slice")
+                                                                    if self.is_logging else self.job_list)]
+                self._update_psi_slice_and_index = [self._update_psi_create_index(job[1])
+                                                    for job in (tqdm(self.job_list, desc="create psi slice")
+                                                                if self.is_logging else self.job_list)]
             self.is_init = True
 
         self.logger.info("Initializing Messages")
@@ -222,6 +229,7 @@ class BeliefPropagation(nn.Module):
         self.message_map = self.init_messages()  # messages (bi-edges)
         # initialize external field
         self.h = (-self.beta * self.mean_w * self.marginal_psi.clone()).sum(0)
+        self.logger.info("BP Initialization Completed")
 
     def bp_infer_parallel(self):
         """
@@ -256,10 +264,12 @@ class BeliefPropagation(nn.Module):
         return diff
 
     def update_psi_h_fast(self, i):
-        write_nodes_slice_tensor, read_message_slice_tensor, index_tensor = self._update_psi_index[i]
+        write_nodes_slice_tensor, read_messages_slice_tensor, index_tensor = self._update_psi_slice_and_index[i]
+        if read_messages_slice_tensor.sum() == 0:  # isolated node
+            return
         # sum all messages
-        src = 1 + self.message_map[read_message_slice_tensor].clone() * \
-              (torch.exp(self.beta * self.w_indexed[read_message_slice_tensor]) - 1)
+        src = 1 + self.message_map[read_messages_slice_tensor].clone() * \
+              (torch.exp(self.beta * self.w_indexed[read_messages_slice_tensor]) - 1)
         out = self.marginal_psi.new_ones((self.marginal_psi.shape[0], self.marginal_psi.shape[1]))
         out = scatter_mul(src, index_tensor, out=out, dim=0)
         out = out[write_nodes_slice_tensor]
@@ -301,6 +311,8 @@ class BeliefPropagation(nn.Module):
 
     def update_message_fast(self, i):
         write_messages_slice_tensor, read_messages_slice_tensor, index_tensor = self._update_message_slice_and_index[i]
+        if read_messages_slice_tensor.sum() == 0:  # isolated node
+            return 0
         # sum all messages
         src = 1 + self.message_map[read_messages_slice_tensor].clone() * \
               (torch.exp(self.beta * self.w_indexed[read_messages_slice_tensor]) - 1)
@@ -317,7 +329,7 @@ class BeliefPropagation(nn.Module):
         self.message_map[write_messages_slice_tensor] = out
         return max_diff
 
-    def _update_message_create_slice(self, target_list):
+    def _update_message_create_slice(self, edge_list):
         # for updating message_map
         write_messages_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
         # for reading message_map
@@ -327,7 +339,7 @@ class BeliefPropagation(nn.Module):
                        (-1)  # a trick
 
         # O(mk) time
-        for src_node, dst_node in target_list:
+        for src_node, dst_node in edge_list:
             src_neighbors = list(self.G.neighbors(src_node))
             src_to_dst_message_index = self.node_id_to_index[src_node] + src_neighbors.index(dst_node)
             if self.bp_type == 'approximate':
@@ -351,6 +363,24 @@ class BeliefPropagation(nn.Module):
         #     pass
         index_tensor = index_tensor[index_tensor != -1]
         return write_messages_slice_tensor, read_messages_slice_tensor, index_tensor
+
+    def create_slice_and_index_mp(self):
+        _update_message_slice_and_index, _update_psi_slice_and_index = [], []
+        with Pool() as p:
+            for result in (
+                    tqdm(p.imap(self._create_slice_and_index_mp, self.job_list),
+                         desc="create slice and index mp",
+                         total=len(self.job_list)
+                         ) if self.is_logging else
+                    p.imap(self._create_slice_and_index_mp, self.job_list)
+            ):
+                _update_message_slice_and_index.append(result[0])
+                _update_psi_slice_and_index.append(result[1])
+        return _update_message_slice_and_index, _update_psi_slice_and_index
+
+    def _create_slice_and_index_mp(self, job):
+        edge_list, node_list = job
+        return self._update_message_create_slice(edge_list), self._update_psi_create_index(node_list)
 
     def bp_infer_legacy(self):
         """
@@ -464,17 +494,17 @@ class BeliefPropagation(nn.Module):
 
     def init_node_w(self):
         node_id_to_index = dict()
-        sum_index = 0
-        for i in self.G.nodes():
-            node_id_to_index[i] = sum_index
-            sum_index += len(list(self.G.neighbors(i)))
-
         w_indexed = torch.zeros(self.num_messages, device=self.beta.device)
-        for i in self.G.nodes():
+        sum_index = 0
+        # O(nk) time
+        for i in (tqdm(self.G.nodes(), desc="init indexes") if self.is_logging else self.G.nodes()):
+            node_id_to_index[i] = sum_index
             i_neighbors = list(self.G.neighbors(i))
             for index, j in enumerate(self.G.neighbors(i)):
-                i_to_j_index = node_id_to_index[i] + index
+                i_to_j_index = sum_index + index
                 w_indexed[i_to_j_index] = self.adjacency_matrix[i, j]
+            sum_index += len(list(self.G.neighbors(i)))
+
         w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
 
         return node_id_to_index, w_indexed
@@ -485,20 +515,22 @@ class BeliefPropagation(nn.Module):
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-
+    # logging.basicConfig(level=logging.INFO)
     num_groups = 4
-    sizes = [100] * num_groups
-    P = np.ones((num_groups, num_groups)) * 0.05
+    sizes = [500] * num_groups
+    P = np.ones((num_groups, num_groups)) * 0.01
     for i in range(len(P)):
-        P[i][i] = P[i][i] * 5
+        P[i][i] = P[i][i] * 3
     g = nx.stochastic_block_model(sizes, P, seed=0)
     adj = nx.to_scipy_sparse_matrix(g)
     mean_degree = adj.mean() * g.number_of_nodes()
-    for parallel_min_iter in range(50, 300, 50):
-        bp = BeliefPropagation(num_groups, parallel_min_iter=parallel_min_iter)
-        entropy = EntropyLoss()
-        # bp = bp.cuda()
-        message_map, marginal_psi, message_index_list = bp(adj)
-        entropy_loss = entropy(marginal_psi)
-        entropy_loss.backward(retain_graph=True)
+    print("mean_degree", mean_degree)
+    bp = BeliefPropagation(num_groups, mean_degree=mean_degree, verbose=True,
+                           max_num_iter=50)
+    entropy = EntropyLoss()
+    # bp = bp.cuda()
+    message_map, marginal_psi, message_index_list = bp(adj)
+    entropy_loss = entropy(marginal_psi)
+    entropy_loss.backward(retain_graph=True)
+    print(bp.beta.grad)
+    print(len(bp.job_list[0][0]))
