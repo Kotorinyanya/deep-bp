@@ -1,11 +1,12 @@
-from utils import *
-from boxx import timeit
 from tqdm import tqdm
+
+from utils import *
 
 
 class BPJob():
 
-    def __init__(self):
+    def __init__(self, max_job_count):
+        self.max_job_count = max_job_count
         self.writing_edges_set = set()
         self.reading_edges_set = set()
         self.writing_nodes_set = set()
@@ -17,6 +18,11 @@ class BPJob():
         self.writing_edges_set.add(write_edge)
         self.writing_nodes_set.add(write_node)
         self.reading_edges_set |= read_edges
+
+    def check_is_full(self):
+        if len(self.writing_nodes_set) >= self.max_job_count:
+            return True
+        return False
 
     def check_writable(self, edge_to_write):
         i, j = edge_to_write
@@ -34,11 +40,11 @@ class BPJob():
         return self.writing_edges_set, self.writing_nodes_set
 
 
-def _create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, verbose):
+def _create_job_list_parallel(G, todo_list, max_node_count, seed, bp_type, verbose):
     np.random.seed(seed)
     # set is faster than list to do subtraction
     todo_set, doing_set = set(todo_list), set()
-    bp_job_empty_list = [BPJob()]
+    bp_job_empty_list = [BPJob(max_node_count)]
     bp_job_full_list = []
 
     for edge_to_write in (tqdm(todo_set, desc="todo_set") if verbose else todo_set):
@@ -56,12 +62,12 @@ def _create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, v
                 break
 
         if not succeed:
-            new_bp_job = BPJob()
+            new_bp_job = BPJob(max_node_count)
             new_bp_job.add_job(edge_to_write, j, edges_to_read)
             bp_job_empty_list.append(new_bp_job)
         else:
             bp_job.add_job(edge_to_write, j, edges_to_read)
-            if len(bp_job) >= parallel_max_edges:
+            if bp_job.check_is_full():
                 bp_job_empty_list.remove(bp_job)
                 bp_job_full_list.append(bp_job)
     job_list = [job.get_job() for job in bp_job_full_list + bp_job_empty_list]
@@ -69,13 +75,14 @@ def _create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, v
     return job_list
 
 
+# before optimization
 def __create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, verbose):
     np.random.seed(seed)
     # set is faster than list to do subtraction
     todo_set, doing_set = set(todo_list), set()
     job_list = []
     if verbose:
-        pbar = tqdm(total=len(todo_set), desc="create job list")
+        pbar = tqdm(total=len(todo_set), desc="todo_set")
     while len(todo_set) > 0:
         writing_edges_set, reading_edges_set, writing_nodes_set = set(), set(), set()
         # avoid racing
