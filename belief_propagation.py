@@ -23,14 +23,15 @@ class BeliefPropagation(nn.Module):
                  num_groups,
                  mean_degree=None,
                  max_num_iter=100,
-                 bp_max_diff=1e-5,
+                 bp_max_diff=1e-2,
                  bp_dumping_rate=1.0,
                  num_workers=1,
                  is_logging=True,
-                 verbose=False,
+                 verbose_iter=False,
+                 verbose_init=True,
                  bp_type='approximate',
                  bp_implementation_type='parallel',
-                 parallel_max_edges=1000,
+                 parallel_max_edges=100,
                  summary_writer=None,
                  histogram_dim=1,
                  seed=0):
@@ -40,10 +41,11 @@ class BeliefPropagation(nn.Module):
         :param num_groups: pooling size
         :param mean_degree: not required, but highly recommend
         :param max_num_iter: max BP iteration to converge,
-                            NOTE: large number of iteration blows up RAM
+                            NOTE: large number of iteration blows up RAM for gradient descent.
         :param bp_max_diff: max BP diff to converge
         :param bp_dumping_rate: BP dumping rate, 1.0 as default
-        :param verbose: logging level
+        :param verbose_iter: verbose during iteration
+        :param verbose_init: verbose during initialization
         :param num_workers: multi-threading workers (for legacy)
         :param is_logging: if logging
         :param bp_type: 'approximate' with external field h, or 'exact'
@@ -68,8 +70,9 @@ class BeliefPropagation(nn.Module):
         self.seed = seed
         self.is_logging = is_logging
         self.logger = logging.getLogger(str(self.__class__.__name__))
-        if verbose:
+        if verbose_iter:
             logging.basicConfig(level=logging.INFO)
+        self.verbose_init = verbose_init
         self.writer = summary_writer
         self.histogram_dim = histogram_dim
         self.num_workers = num_workers
@@ -80,27 +83,31 @@ class BeliefPropagation(nn.Module):
 
         # initialize beta, the learning parameter
         if mean_degree is None:
-            self.logger.error(
-                "Initializing `beta` to `1.0` without mean_degree\n"
-                "BP requires a rough mean degree of the network to initialize "
-                "the learning parameter `beta` to beta_ast, "
-                "which makes learning faster and more stable. "
+            self.logger.warning(
+                "Initializing beta without mean_degree\n"
+                "BP requires a rough mean degree of the network to initialize, "
+                "which makes learning process faster and more stable. "
                 "Without mean degree being specified, "
-                "`beta` will be initialized to `1.0`.\n"
+                "beta will be initialized to `1.0`.\n"
                 "Please pass the mean degree of the network by argument "
-                "when calling, for example BeliefPropagation(number_of_groups=q, mean_degree=c)"
+                "when calling, for example BeliefPropagation(num_groups=q, mean_degree=c)\n"
+                "Otherwise beta will be initialized when calling forward()"
             )
             beta = torch.tensor(1.0, dtype=torch.float)
+            self.is_beta_init = False
         elif mean_degree > 0:
             # beta = torch.log(
             #     self.num_groups / (torch.sqrt(torch.tensor(mean_degree, dtype=torch.float)) - 1) + 1
             # ).unsqueeze(-1)
-            beta = np.log(self.num_groups / np.sqrt(mean_degree - 1) + 1)
+            beta = np.log(self.num_groups / (np.sqrt(mean_degree) - 1) + 1)
             beta = torch.tensor(beta, dtype=torch.float)
+            self.is_beta_init = True
+        else:
+            raise Exception("What are u doing???")
         self.beta = nn.Parameter(data=beta)
 
         # self.logger.info('\t mean_degree \t {0:.2f} \t beta \t {1} \t '.format(mean_degree, self.beta.data.item()))
-        self.logger.info('beta initialized to {0}'.format(self.beta.data))
+        self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
         # initialized later on calling forward
         self.G, self.adjacency_matrix, self.mean_w, self.num_nodes, self.mean_degree = None, None, None, None, None
@@ -127,15 +134,15 @@ class BeliefPropagation(nn.Module):
             self.bp_logging(num_iter, max_diff)
 
         if (self.beta < 0.05).sum() > 0:
-            raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP (which is not good), "
-                            "please consider adding the weight for entropy_loss".format(self.beta.data))
+            raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP (which is not good)"
+                            .format(self.beta.data))
 
         return self.message_map, self.marginal_psi, self.message_index_list
 
     def bp_logging(self, num_iter, max_diff):
         is_converged = True if max_diff < self.bp_max_diff else False
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
-        self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1} \t max_diff \t {2:.5f}"
+        self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1} \t max_diff \t {2:.2e}"
                          .format(is_converged, num_iter, max_diff))
         if self.writer is not None:
             self.writer.add_scalar("beta", self.beta.item(), self.global_step)
@@ -161,8 +168,8 @@ class BeliefPropagation(nn.Module):
             self.global_step += 1
         if not is_converged:
             self.logger.warning(
-                "SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2}. "
-                "Indicating a spin-glass (SG) phase in BP".format(
+                "SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2:.2e}. "
+                "Indicating a spin-glass (SG) or paramagnetic (P) phase in BP".format(
                     num_iter, self.beta.data, max_diff))
         if (self.beta < 0.05).sum() > 0:
             self.logger.critical("P:beta={0}, indicating paramagnetic phase in BP (which is not good), "
@@ -192,6 +199,12 @@ class BeliefPropagation(nn.Module):
             self.message_index_list = list(self.G.to_directed().edges())  # set is way more faster than list
             self.num_messages = len(self.message_index_list)
 
+            if not self.is_beta_init:
+                self.logger.warning("Initializing beta again with "
+                                    "'torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)'")
+                self.beta.data = torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)
+                self.logger.warning('beta initialized to {0}'.format(self.beta.data))
+
             if self.bp_implementation_type == 'parallel':
                 self.logger.info("Initializing indexes")
                 self.node_id_to_index, self.w_indexed = self.init_node_w()
@@ -206,18 +219,18 @@ class BeliefPropagation(nn.Module):
                 # job_list to avoid race, job -> (edges, nodes)
                 self.job_list = _create_job_list_parallel(
                     self.G, self.message_index_list,
-                    self.parallel_max_edges / self.mean_degree,  # need to be proved
-                    self.seed, self.bp_type, self.is_logging
+                    self.parallel_max_edges,
+                    self.seed, self.bp_type, self.verbose_init
                 )
                 self.logger.info("Creating slice and index")
                 # self._update_message_slice_and_index, self._update_psi_slice_and_index = \
                 #     self.create_slice_and_index_mp()
                 self._update_message_slice_and_index = [self._update_message_create_slice(job[0])
                                                         for job in (tqdm(self.job_list, desc="create message slice")
-                                                                    if self.is_logging else self.job_list)]
+                                                                    if self.verbose_init else self.job_list)]
                 self._update_psi_slice_and_index = [self._update_psi_create_index(job[1])
                                                     for job in (tqdm(self.job_list, desc="create psi slice")
-                                                                if self.is_logging else self.job_list)]
+                                                                if self.verbose_init else self.job_list)]
             self.is_init = True
 
         self.logger.info("Initializing Messages")
@@ -247,7 +260,7 @@ class BeliefPropagation(nn.Module):
             end = time.time()
 
             self.logger.info(
-                "num_iter \t {:3d} \t time \t {:.2f}ms \t max_diff {}".format(num_iter, (end - start) * 1000, max_diff))
+                "num_iter \t {:3d} \t time \t {:.2f}ms \t max_diff {:.2e}".format(num_iter, (end - start) * 1000, max_diff))
 
             if max_diff < self.bp_max_diff:
                 return num_iter, max_diff
@@ -371,7 +384,7 @@ class BeliefPropagation(nn.Module):
                     tqdm(p.imap(self._create_slice_and_index_mp, self.job_list),
                          desc="create slice and index mp",
                          total=len(self.job_list)
-                         ) if self.is_logging else
+                         ) if self.verbose_init else
                     p.imap(self._create_slice_and_index_mp, self.job_list)
             ):
                 _update_message_slice_and_index.append(result[0])
@@ -497,7 +510,7 @@ class BeliefPropagation(nn.Module):
         w_indexed = torch.zeros(self.num_messages, device=self.beta.device)
         sum_index = 0
         # O(nk) time
-        for i in (tqdm(self.G.nodes(), desc="init indexes") if self.is_logging else self.G.nodes()):
+        for i in (tqdm(self.G.nodes(), desc="init indexes") if self.verbose_init else self.G.nodes()):
             node_id_to_index[i] = sum_index
             i_neighbors = list(self.G.neighbors(i))
             for index, j in enumerate(self.G.neighbors(i)):
@@ -516,16 +529,16 @@ class BeliefPropagation(nn.Module):
 
 if __name__ == '__main__':
     # logging.basicConfig(level=logging.INFO)
-    num_groups = 4
+    num_groups = 2
     sizes = [500] * num_groups
-    P = np.ones((num_groups, num_groups)) * 0.01
+    P = np.ones((num_groups, num_groups)) * 0.002
     for i in range(len(P)):
         P[i][i] = P[i][i] * 3
     g = nx.stochastic_block_model(sizes, P, seed=0)
     adj = nx.to_scipy_sparse_matrix(g)
     mean_degree = adj.mean() * g.number_of_nodes()
     print("mean_degree", mean_degree)
-    bp = BeliefPropagation(num_groups, mean_degree=mean_degree, verbose=True,
+    bp = BeliefPropagation(num_groups, mean_degree=mean_degree, verbose_iter=True,
                            max_num_iter=50)
     entropy = EntropyLoss()
     # bp = bp.cuda()

@@ -43,6 +43,12 @@ def overlap(s1, s2):
     return max_overlap
 
 
+def normalized_overlap(s1, s2, max_na):
+    over_lap = overlap(s1, s2)
+    norm_overlap = (over_lap - max_na) / (1 - max_na)
+    return norm_overlap
+
+
 def compute_modularity(G, marginal_psi):
     """
     This modularity can't be used with auto_grad as assignment (line 2) is disperse.
