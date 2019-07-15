@@ -54,7 +54,7 @@ class BeliefPropagation(nn.Module):
                                 few value means faster inference, large value means worse approximation (h)
         :param summary_writer: TensorBoardX
         :param histogram_dim: 1 is fast, 0 is extremely slow but detailed
-        :param disable_gradient: to save memory
+        :param disable_gradient: to save memory for large number of iterations
         :param seed:
         """
 
@@ -82,7 +82,7 @@ class BeliefPropagation(nn.Module):
         self.histogram_dim = histogram_dim
         self.num_workers = num_workers
         self.bp_dumping_rate = bp_dumping_rate
-        self.bp_max_diff = bp_max_diff  # max_diff = max_diff / num_groups ?
+        self.bp_max_diff = bp_max_diff
         self.max_num_iter = max_num_iter
         self.num_groups = num_groups
 
@@ -114,22 +114,16 @@ class BeliefPropagation(nn.Module):
         # self.logger.info('\t mean_degree \t {0:.2f} \t beta \t {1} \t '.format(mean_degree, self.beta.data.item()))
         self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
-        # initialized later on calling forward
-        self.G, self.adjacency_matrix, self.mean_w, self.num_nodes, self.mean_degree = None, None, None, None, None
-        self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_set = None, None, None, None, None
-        self.node_id_to_index, self.num_messages = None, None
-        self.message_to_index_map, self.message_to_index_map_inverse = None, None
-        self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
-        self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
         self.is_init, self.global_step = False, 0
 
-    def forward(self, adjacency_matrix):
+    def forward(self, edge_index, edge_attr=None):
         """
 
-        :param adjacency_matrix: csr_matrix, or numpy array
+        :param edge_index:
+        :param edge_attr:
         :return:
         """
-        self.init_bp(adjacency_matrix)
+        self.init_bp(edge_index, edge_attr)
 
         if self.bp_implementation_type == 'parallel':
             num_iter, max_diff = self.bp_infer_parallel()
@@ -173,17 +167,20 @@ class BeliefPropagation(nn.Module):
                                                   self.global_step)
             self.global_step += 1
         if not is_converged:
-            self.logger.warning(
-                "SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2:.2e}. ".format(
-                    num_iter, self.beta.data, max_diff))
+            self.logger.warning("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
+                                .format(num_iter, self.beta.data, max_diff))
+            self.logger.warning("parallel_max_node_percent={0:.2f}, in case of parallelization, "
+                                "reducing this percentage is good for BP to converge"
+                                .format(self.parallel_max_node_percent))
         if (self.beta < 0.05).sum() > 0:
             self.logger.critical("P:beta={0}, indicating paramagnetic phase in BP, "
                                  "please consider adding the weight for entropy_loss".format(self.beta.data))
 
-    def init_bp(self, adjacency_matrix):
+    def init_bp(self, edge_index, edge_attr=None):
         """
-        Initialize BP contents
-        :param adjacency_matrix:
+
+        :param edge_index:
+        :param edge_attr:
         :return:
         """
         # seed for a stable gradient descent
@@ -191,22 +188,26 @@ class BeliefPropagation(nn.Module):
         torch.cuda.manual_seed_all(self.seed)
 
         if self.is_init:
-            if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.adjacency_matrix):
+            # if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.adjacency_matrix):
+            if not (torch.all(torch.eq(edge_index, self.edge_index)) and
+                    torch.all(torch.eq(edge_attr, self.edge_attr))):
                 # if the input adjacency_matrix changes, job_list need to be re initialized
                 self.is_init = False
         if not self.is_init:
             self.logger.info("Initializing BP")
+            adjacency_matrix = edge_index_to_adj(edge_index, edge_attr)
             self.G = nx.to_networkx_graph(adjacency_matrix)
-            self.adjacency_matrix = nx.to_scipy_sparse_matrix(self.G).astype(np.float)  # connectivity matrix
-            self.mean_w = self.adjacency_matrix.mean()
+            self.adjacency_matrix = adjacency_matrix
             self.num_nodes = self.G.number_of_nodes()
+            self.mean_w = self.adjacency_matrix.mean()
             self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
             self.message_to_index_map = {e: i for i, e in enumerate(self.G.to_directed().edges())}
             self.message_to_index_map_inverse = {v: k for k, v in self.message_to_index_map.items()}
             self.message_index_set = set(self.message_to_index_map.keys())  # set is way more faster than list
             self.num_messages = len(self.message_index_set)
-            self.parallel_max_node_percent = 1 / torch.sqrt(self.mean_degree + 1) \
-                if self.parallel_max_node_percent is None else self.parallel_max_node_percent
+            self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
+                                              if self.parallel_max_node_percent is None else
+                                              self.parallel_max_node_percent)
 
         self.logger.info("Initializing Messages")
         # with timeit(name="Initialize Messages"):
@@ -234,7 +235,7 @@ class BeliefPropagation(nn.Module):
 
             if self.bp_implementation_type == 'parallel':
                 self.logger.info("Initializing indexes")
-                self.node_id_to_index, self.w_indexed = self.init_node_w()
+                self.w_indexed = self.init_node_w()
 
             if self.bp_implementation_type == 'legacy':
                 # multi-thread synchronization using lock
@@ -423,21 +424,16 @@ class BeliefPropagation(nn.Module):
         return message_map
 
     def init_node_w(self):
-        node_id_to_index = dict()
-        w_indexed = torch.zeros(self.num_messages, device=self.beta.device)
-        sum_index = 0
-        # O(nk) time
-        for i in (tqdm(self.G.nodes(), desc="init indexes") if self.verbose_init else self.G.nodes()):
-            node_id_to_index[i] = sum_index
-            i_neighbors = list(self.G.neighbors(i))
-            for index, j in enumerate(self.G.neighbors(i)):
-                i_to_j_index = sum_index + index
-                w_indexed[i_to_j_index] = self.adjacency_matrix[i, j]
-            sum_index += len(list(self.G.neighbors(i)))
 
+        w_indexed = torch.tensor([
+            self.adjacency_matrix[i, j] for k, (i, j) in (
+                tqdm(self.message_to_index_map_inverse.items(), desc="w_indexed")
+                if self.verbose_init else
+                self.message_to_index_map_inverse.items()
+            )], device=self.beta.device)
         w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
 
-        return node_id_to_index, w_indexed
+        return w_indexed
 
     def __repr__(self):
         return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
@@ -445,22 +441,32 @@ class BeliefPropagation(nn.Module):
 
 
 if __name__ == '__main__':
-    # logging.basicConfig(level=logging.INFO)
     num_groups = 2
-    sizes = [500] * num_groups
-    P = np.ones((num_groups, num_groups)) * 0.002
+    sizes = np.asarray([50] * num_groups)
+    epslion = 0.3
+    P = np.ones((num_groups, num_groups)) * 0.01
     for i in range(len(P)):
-        P[i][i] = P[i][i] * 3
-    g = nx.stochastic_block_model(sizes, P, seed=0)
-    adj = nx.to_scipy_sparse_matrix(g)
-    mean_degree = adj.mean() * g.number_of_nodes()
-    print("mean_degree", mean_degree)
-    bp = BeliefPropagation(num_groups, mean_degree=mean_degree, verbose_iter=True,
-                           max_num_iter=50, bp_implementation_type='parallel', parallel_max_node_percent=500)
+        P[i][i] = P[i][i] / epslion
+    G = nx.stochastic_block_model(sizes, P, seed=0)
+    adj = nx.to_scipy_sparse_matrix(G)
+    edge_index, edge_attr = adj_to_edge_index(adj)
+    c = nx.to_scipy_sparse_matrix(G).mean() * G.number_of_nodes()
+    ground_truth = []
+    for i in G.nodes():
+        ground_truth.append(G.node[i]['block'])
+    print(c)
+    epslion_ast = (np.sqrt(c) - 1) / (np.sqrt(c) - 1 + num_groups)
+    print(epslion, epslion_ast, epslion < epslion_ast)
+    percent = 1 / np.sqrt(c + 1)
+    print(percent)
+
+    bp = BeliefPropagation(num_groups, mean_degree=c, verbose_iter=True,
+                           max_num_iter=100,
+                           parallel_max_node_percent=None,
+                           bp_max_diff=1e-2, disable_gradient=True, )
+    # bp.beta.data = torch.tensor(1.)
     entropy = EntropyLoss()
     # bp = bp.cuda()
-    message_map, marginal_psi, message_index_list = bp(adj)
+    message_map, marginal_psi, message_index_list = bp(edge_index, edge_attr)
     entropy_loss = entropy(marginal_psi)
-    entropy_loss.backward(retain_graph=True)
-    print(bp.beta.grad)
-    print(len(bp.job_list[0][0]))
+    print(entropy_loss)
