@@ -135,7 +135,13 @@ def networkx_to_data(G, node_feature_dim=0):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def edge_index_to_adj(edge_index, edge_attr=None):
+def edge_index_to_csr(edge_index, edge_attr=None):
+    """
+    coo_matrix(coordinate matrix) is fast to get row
+    :param edge_index:
+    :param edge_attr:
+    :return:
+    """
     if edge_attr is not None:
         assert edge_attr.shape[1] == 1
     edge_attr = edge_attr.reshape(-1) if edge_attr is not None else None
@@ -144,6 +150,17 @@ def edge_index_to_adj(edge_index, edge_attr=None):
     num_nodes = row.max() + 1
     adj = csr_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
     return adj
+
+
+def csr_to_symmetric(csr_matrix):
+    """
+    This is suuuuupper slow
+    :param csr_matrix:
+    :return:
+    """
+    rows, cols = csr_matrix.nonzero()
+    csr_matrix[cols, rows] = csr_matrix[rows, cols]
+    return csr_matrix
 
 
 def adj_to_edge_index(adj):

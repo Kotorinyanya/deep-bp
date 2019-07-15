@@ -195,14 +195,17 @@ class BeliefPropagation(nn.Module):
                 self.is_init = False
         if not self.is_init:
             self.logger.info("Initializing BP")
-            adjacency_matrix = edge_index_to_adj(edge_index, edge_attr)
-            self.G = nx.to_networkx_graph(adjacency_matrix)
-            self.adjacency_matrix = adjacency_matrix
-            self.num_nodes = self.G.number_of_nodes()
+            self.adjacency_matrix = edge_index_to_csr(edge_index, edge_attr)
+            assert self.adjacency_matrix[0, 1] == self.adjacency_matrix[1, 0]  # symmetric
+            if self.bp_implementation_type == 'legacy':
+                self.G = nx.to_networkx_graph(self.adjacency_matrix)
+            self.node_ids = torch.unique(edge_index)
+            self.num_nodes = len(self.node_ids)
             self.mean_w = self.adjacency_matrix.mean()
             self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
-            self.message_to_index_map = {e: i for i, e in enumerate(self.G.to_directed().edges())}
-            self.message_to_index_map_inverse = {v: k for k, v in self.message_to_index_map.items()}
+            self.logger.info("Initializing indexes")
+            self.message_to_index_map, self.message_to_index_map_inverse, self.w_indexed = \
+                self.init_message_to_index_map_and_w()
             self.message_index_set = set(self.message_to_index_map.keys())  # set is way more faster than list
             self.num_messages = len(self.message_index_set)
             self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
@@ -233,10 +236,6 @@ class BeliefPropagation(nn.Module):
                 self.beta.data = beta
                 self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
-            if self.bp_implementation_type == 'parallel':
-                self.logger.info("Initializing indexes")
-                self.w_indexed = self.init_node_w()
-
             if self.bp_implementation_type == 'legacy':
                 # multi-thread synchronization using lock
                 self._lock_psi = [threading.Lock() for _ in range(len(self.marginal_psi))]
@@ -246,7 +245,7 @@ class BeliefPropagation(nn.Module):
                 self.logger.info("Initializing Job List")
                 # job_list to avoid race, job -> (edges, nodes)
                 self.job_list = _create_job_list_parallel(
-                    self.G, self.message_index_set,
+                    self.adjacency_matrix, self.message_index_set,
                     self.parallel_max_node_percent * self.num_nodes,
                     self.seed, self.bp_type, self.verbose_init
                 )
@@ -340,7 +339,7 @@ class BeliefPropagation(nn.Module):
         for dst_node in nodes:
             write_nodes_slice_tensor[dst_node] = 1  # mark message to write
             src_message_indexes = [self.message_to_index_map[(src_node, dst_node)]
-                                   for dst_node, src_node in self.G.edges(dst_node)]
+                                   for src_node in self.adjacency_matrix.getrow(dst_node).nonzero()[1]]
             if len(src_message_indexes) > 0:
                 index_tensor[src_message_indexes] = int(dst_node)  # index message to read for torch_scatter
                 read_message_slice_tensor[src_message_indexes] = 1  # for slicing input message
@@ -384,19 +383,16 @@ class BeliefPropagation(nn.Module):
             src_to_dst_message_index = self.message_to_index_map[(src_node, dst_node)]
             if self.bp_type == 'approximate':
                 src_message_indexes = [self.message_to_index_map[(k, src_node)]
-                                       for k in self.G.neighbors(src_node) if k != dst_node]
+                                       for k in self.adjacency_matrix.getrow(src_node).nonzero()[1]
+                                       if k != dst_node]
                 if len(src_message_indexes) > 0:
                     write_messages_slice_tensor[src_to_dst_message_index] = 1
                     read_messages_slice_tensor[src_message_indexes] = 1
                     index_tensor[src_message_indexes] = src_to_dst_message_index
 
             elif self.bp_type == 'exact':
-                src_messages1 = [(k, src_node) for k in self.G.neighbors(src_node) if k != dst_node]
-                src_messages2 = [(k, src_node) for k in self.G.nodes() if k not in [src_node, dst_node]]
                 raise NotImplementedError()
         # assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(write_messages_slice_tensor).max()
-        # if index_tensor.max() != torch.nonzero(write_messages_slice_tensor).max():
-        #     pass
         index_tensor = index_tensor[index_tensor != -1]  # remove redundant indexes
         return write_messages_slice_tensor, read_messages_slice_tensor, index_tensor
 
@@ -435,6 +431,23 @@ class BeliefPropagation(nn.Module):
 
         return w_indexed
 
+    def init_message_to_index_map_and_w(self):
+        message_to_index_map, message_to_index_map_inverse = {}, {}
+        length = self.adjacency_matrix.count_nonzero()
+        w_indexed = torch.zeros(length, dtype=torch.float)
+        for i, (src_node, dst_node) in enumerate(
+                tqdm(zip(*self.adjacency_matrix.nonzero()), total=length, desc="")
+                if self.verbose_init else
+                zip(*self.adjacency_matrix.nonzero())
+        ):
+            w = self.adjacency_matrix[src_node, dst_node]
+            w_indexed[i] = float(w)
+            message_to_index_map[(src_node, dst_node)] = i
+            message_to_index_map_inverse[i] = (src_node, dst_node)
+
+        w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
+        return message_to_index_map, message_to_index_map_inverse, w_indexed
+
     def __repr__(self):
         return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
             self.__class__.__name__, self.num_groups, self.max_num_iter, self.bp_max_diff, self.bp_dumping_rate)
@@ -442,9 +455,9 @@ class BeliefPropagation(nn.Module):
 
 if __name__ == '__main__':
     num_groups = 2
-    sizes = np.asarray([50] * num_groups)
-    epslion = 0.3
-    P = np.ones((num_groups, num_groups)) * 0.01
+    sizes = np.asarray([5] * num_groups)
+    epslion = 0.2
+    P = np.ones((num_groups, num_groups)) * 0.1
     for i in range(len(P)):
         P[i][i] = P[i][i] / epslion
     G = nx.stochastic_block_model(sizes, P, seed=0)

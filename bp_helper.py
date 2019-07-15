@@ -40,7 +40,17 @@ class BPJob():
         return self.writing_edges_set, self.writing_nodes_set
 
 
-def _create_job_list_parallel(G, todo_list, max_node_count, seed, bp_type, verbose):
+def _create_job_list_parallel(adj, todo_list, max_node_count, seed, bp_type, verbose):
+    """
+
+    :param adj: csr_matrix
+    :param todo_list: edges
+    :param max_node_count:
+    :param seed:
+    :param bp_type:
+    :param verbose:
+    :return:
+    """
     np.random.seed(seed)
     # set is faster than list to do subtraction
     todo_set, doing_set = set(todo_list), set()
@@ -52,7 +62,8 @@ def _create_job_list_parallel(G, todo_list, max_node_count, seed, bp_type, verbo
         i, j = edge_to_write  # i -> j
 
         for num, bp_job in enumerate(list(bp_job_empty_list)):
-            edges_to_read = set((k, i) for k in G.neighbors(i) if k != j)
+            edges_to_read = set(zip(*adj.getrow(i).nonzero()))
+            # edges_to_read = set((k, i) for k in G.neighbors(i) if k != j)
             if not bp_job.check_writable(edge_to_write):
                 continue
             elif not bp_job.check_readable(edges_to_read):
