@@ -32,7 +32,6 @@ class BeliefPropagation(nn.Module):
                  bp_implementation_type='parallel',
                  parallel_max_node_percent=None,
                  summary_writer=None,
-                 histogram_dim=1,
                  disable_gradient=False,
                  seed=0):
         """
@@ -53,7 +52,6 @@ class BeliefPropagation(nn.Module):
         :param parallel_max_node_percent: maximum percent of nodes to parallelize,
                                 few value means faster inference, large value means worse approximation (h)
         :param summary_writer: TensorBoardX
-        :param histogram_dim: 1 is fast, 0 is extremely slow but detailed
         :param disable_gradient: to save memory for large number of iterations
         :param seed:
         """
@@ -79,7 +77,6 @@ class BeliefPropagation(nn.Module):
             logging.basicConfig(level=logging.INFO)
         self.verbose_init = verbose_init
         self.writer = summary_writer
-        self.histogram_dim = histogram_dim
         self.num_workers = num_workers
         self.bp_dumping_rate = bp_dumping_rate
         self.bp_max_diff = bp_max_diff
@@ -151,20 +148,11 @@ class BeliefPropagation(nn.Module):
             self.writer.add_scalar("num_iter", num_iter, self.global_step)
             self.writer.add_scalar("max_diff", max_diff, self.global_step)
             if self.bp_implementation_type == 'parallel':
-                if self.histogram_dim == 1:
-                    for i in range(self.num_groups):
-                        self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
-                                                  self.global_step)
-                        self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
-                                                  self.global_step)
-                elif self.histogram_dim == 0:
-                    for index in range(self.num_messages):
-                        i, j = self.message_to_index_map_inverse[index]
-                        self.writer.add_histogram("message_{}_to_{}".format(i, j), self.message_map[index, :].flatten(),
-                                                  self.global_step)
-                    for n in range(self.num_nodes):
-                        self.writer.add_histogram("psi_{}".format(n), self.marginal_psi[n, :].flatten(),
-                                                  self.global_step)
+                for i in range(self.num_groups):
+                    self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
+                                              self.global_step)
+                    self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
+                                              self.global_step)
             self.global_step += 1
         if not is_converged:
             self.logger.warning("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
@@ -183,6 +171,7 @@ class BeliefPropagation(nn.Module):
         :param edge_attr:
         :return:
         """
+
         # seed for a stable gradient descent
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
@@ -196,30 +185,48 @@ class BeliefPropagation(nn.Module):
         if not self.is_init:
             self.logger.info("Initializing BP")
             self.adjacency_matrix = edge_index_to_csr(edge_index, edge_attr)
-            assert self.adjacency_matrix[0, 1] == self.adjacency_matrix[1, 0]  # symmetric
+            if edge_attr is not None:
+                rand_int = np.random.randint(edge_index.shape[1])
+                assert edge_attr.shape[1] == 1
+                edge_attr = edge_attr.reshape(-1)
+                # check edge_index and edge_attr is in ascending order:
+                assert self.adjacency_matrix[edge_index[0, rand_int], edge_index[1, rand_int]] == edge_attr[rand_int]
+            # check if symmetric
+            assert self.adjacency_matrix[0, 1] == self.adjacency_matrix[1, 0]
             if self.bp_implementation_type == 'legacy':
                 self.G = nx.to_networkx_graph(self.adjacency_matrix)
             self.node_ids = torch.unique(edge_index)
             self.num_nodes = len(self.node_ids)
             self.mean_w = self.adjacency_matrix.mean()
             self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
-            self.logger.info("Initializing indexes")
-            self.message_to_index_map, self.message_to_index_map_inverse, self.w_indexed = \
-                self.init_message_to_index_map_and_w()
+
+            self.logger.info("Initializing message indexes")
+            self.message_to_index_map = {e: i for i, e in enumerate(
+                tqdm(zip(*self.adjacency_matrix.nonzero()), desc="indexes", total=self.adjacency_matrix.count_nonzero())
+                if self.verbose_init else
+                zip(*self.adjacency_matrix.nonzero())
+            )}
+            self.w_indexed = torch.stack([(edge_attr
+                                           if edge_attr is not None else
+                                           torch.ones(edge_index.shape[1], dtype=torch.float))
+                                          for _ in range(self.num_groups)])
             self.message_index_set = set(self.message_to_index_map.keys())  # set is way more faster than list
             self.num_messages = len(self.message_index_set)
             self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
                                               if self.parallel_max_node_percent is None else
                                               self.parallel_max_node_percent)
 
-        self.logger.info("Initializing Messages")
-        # with timeit(name="Initialize Messages"):
-        # initialize by random psi
-        marginal_psi = torch.rand(self.num_nodes, self.num_groups,
-                                  device=self.beta.device)  # the marginal probability of node i
-        self.marginal_psi = marginal_psi / marginal_psi.sum(1).reshape(-1, 1)
-        self.message_map = self.init_messages() if self.bp_implementation_type == 'parallel' \
-            else init_messages_legacy(self)  # messages (bi-edges)
+        self.logger.info("Initializing messages")
+        # initialize psi
+        self.marginal_psi = torch.rand(self.num_nodes, self.num_groups,
+                                       device=self.beta.device)  # the marginal probability of node i
+        self.marginal_psi = self.marginal_psi / self.marginal_psi.sum(1).reshape(-1, 1)
+        # initialize message
+        if self.bp_implementation_type == 'parallel':
+            self.message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
+            self.message_map = self.message_map / self.message_map.sum(1).reshape(-1, 1)
+        elif self.bp_implementation_type == 'legacy':
+            self.message_map = init_messages_legacy(self)
         # initialize external field
         self.h = (-self.beta * self.mean_w * (
             self.marginal_psi.clone()
@@ -430,23 +437,6 @@ class BeliefPropagation(nn.Module):
         w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
 
         return w_indexed
-
-    def init_message_to_index_map_and_w(self):
-        message_to_index_map, message_to_index_map_inverse = {}, {}
-        length = self.adjacency_matrix.count_nonzero()
-        w_indexed = torch.zeros(length, dtype=torch.float)
-        for i, (src_node, dst_node) in enumerate(
-                tqdm(zip(*self.adjacency_matrix.nonzero()), total=length, desc="")
-                if self.verbose_init else
-                zip(*self.adjacency_matrix.nonzero())
-        ):
-            w = self.adjacency_matrix[src_node, dst_node]
-            w_indexed[i] = float(w)
-            message_to_index_map[(src_node, dst_node)] = i
-            message_to_index_map_inverse[i] = (src_node, dst_node)
-
-        w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
-        return message_to_index_map, message_to_index_map_inverse, w_indexed
 
     def __repr__(self):
         return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
