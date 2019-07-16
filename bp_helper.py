@@ -1,144 +1,113 @@
+import random
+
+from scipy.sparse import csc_matrix, dok_matrix
 from tqdm import tqdm
 
 from utils import *
 
 
-class BPJob():
-
-    def __init__(self, max_job_count):
-        self.max_job_count = max_job_count
-        self.writing_edges_set = set()
-        self.reading_edges_set = set()
-        self.writing_nodes_set = set()
-
-    def __len__(self):
-        return len(self.writing_edges_set)
-
-    def add_job(self, write_edge, write_node, read_edges):
-        self.writing_edges_set.add(write_edge)
-        self.writing_nodes_set.add(write_node)
-        self.reading_edges_set |= read_edges
-
-    def check_is_full(self):
-        if len(self.writing_nodes_set) >= self.max_job_count:
-            return True
-        return False
-
-    def check_writable(self, edge_to_write):
-        i, j = edge_to_write
-        if edge_to_write in self.reading_edges_set \
-                or j in self.writing_nodes_set:
-            return False
-        return True
-
-    def check_readable(self, edges_to_read):
-        if common_member(edges_to_read, self.writing_edges_set):
-            return False
-        return True
-
-    def get_job(self):
-        return self.writing_edges_set, self.writing_nodes_set
-
-
-def _create_job_list_parallel(adj, todo_list, max_node_count, seed, bp_type, verbose):
+def adj_to_csc_map(adjacency_matrix):
     """
 
-    :param adj: csr_matrix
-    :param todo_list: edges
-    :param max_node_count:
-    :param seed:
-    :param bp_type:
-    :param verbose:
-    :return:
+    :param adjacency_matrix:
+    :return: row: out messages, col: in messages
     """
-    np.random.seed(seed)
-    # set is faster than list to do subtraction
-    todo_set, doing_set = set(todo_list), set()
-    bp_job_empty_list = [BPJob(max_node_count)]
-    bp_job_full_list = []
-
-    for edge_to_write in (tqdm(todo_set, desc="todo_set") if verbose else todo_set):
-        succeed = False
-        i, j = edge_to_write  # i -> j
-
-        for num, bp_job in enumerate(list(bp_job_empty_list)):
-            edges_to_read = set(zip(*adj.getrow(i).nonzero()))
-            # edges_to_read = set((k, i) for k in G.neighbors(i) if k != j)
-            if not bp_job.check_writable(edge_to_write):
-                continue
-            elif not bp_job.check_readable(edges_to_read):
-                continue
-            else:
-                succeed = True
-                break
-
-        if not succeed:
-            new_bp_job = BPJob(max_node_count)
-            new_bp_job.add_job(edge_to_write, j, edges_to_read)
-            bp_job_empty_list.append(new_bp_job)
-        else:
-            bp_job.add_job(edge_to_write, j, edges_to_read)
-            if bp_job.check_is_full():
-                bp_job_empty_list.remove(bp_job)
-                bp_job_full_list.append(bp_job)
-    job_list = [job.get_job() for job in bp_job_full_list + bp_job_empty_list]
-
-    return job_list
+    row, col = adjacency_matrix.nonzero()
+    data = np.arange(adjacency_matrix.count_nonzero()) + 1
+    csc_map = csc_matrix((data, (row, col)))
+    return csc_map
 
 
-# before optimization
-def __create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, verbose):
-    np.random.seed(seed)
-    # set is faster than list to do subtraction
-    todo_set, doing_set = set(todo_list), set()
+def _create_job_list_parallel_fast(csc_map, max_node_count, seed, verbose=True):
+    all_nodes = set(np.unique(csc_map.nonzero()[0]))
+    global_todo_nodes = set(all_nodes)
     job_list = []
+
     if verbose:
-        pbar = tqdm(total=len(todo_set), desc="todo_set")
-    while len(todo_set) > 0:
-        writing_edges_set, reading_edges_set, writing_nodes_set = set(), set(), set()
-        # avoid racing
-        for i_to_j in todo_set:
-            i, j = i_to_j
-            if i_to_j in reading_edges_set or j in writing_nodes_set:
-                continue
-            if bp_type == 'approximate':
-                to_read_edge_set = set((k, i) for k in G.neighbors(i) if k != j)
-            elif bp_type == 'exact':
-                to_read_edge_set = set((k, i) for k in G.nodes() if k not in [i, j])
-            if common_member(to_read_edge_set, writing_edges_set):
-                continue
-            writing_edges_set.add(i_to_j)
-            writing_nodes_set.add(j)
-            reading_edges_set |= to_read_edge_set
-            if len(writing_edges_set) > parallel_max_edges:
+        pbar = tqdm(total=len(global_todo_nodes), desc="todo_nodes")
+
+    seeed = 0
+    while len(global_todo_nodes) > 0:
+        nodes_to_choose = set(global_todo_nodes)
+        blocked_nodes, local_doing_nodes = set(), set()
+        while len(nodes_to_choose) > 0:
+            random.seed(seed + seeed)
+            seeed += 1 + len(global_todo_nodes) + len(blocked_nodes)  # just a random number
+            dst_node = random.sample(nodes_to_choose, 1)[0]
+            neighbors = set(csc_map.getcol(dst_node).nonzero()[0])
+            local_doing_nodes.add(dst_node)
+            blocked_nodes.add(dst_node)
+            blocked_nodes |= neighbors
+            nodes_to_choose -= blocked_nodes
+            if len(local_doing_nodes) >= max_node_count:
                 break
-        todo_set -= writing_edges_set
-        doing_set |= writing_edges_set
-        job_list.append((writing_edges_set, writing_nodes_set))
+        job_list.append(local_doing_nodes)
+        global_todo_nodes -= local_doing_nodes
 
         if verbose:
-            pbar.update(len(writing_edges_set))
+            pbar.update(len(local_doing_nodes))
+        seeed += 1
     if verbose:
         pbar.close()
+
     return job_list
 
 
-# appending random nodes have a negative affect for BP to converge
-"""
-append_list = list(doing_set - writing_edges_set)
-np.random.shuffle(append_list)
-# extend jobs in one iter
-for i_to_j in append_list:
-    i, j = i_to_j
-    if i_to_j in reading_edges_set or j in writing_nodes_set:
-        continue
-    if bp_type == 'approximate':
-        to_read_edge_set = set((k, i) for k in G.neighbors(i) if k != j)
-    elif bp_type == 'exact':
-        to_read_edge_set = set((k, i) for k in G.nodes() if k not in [i, j])
-    if common_member(to_read_edge_set, writing_edges_set):
-        continue
-    writing_edges_set.add(i_to_j)
-    writing_nodes_set.add(j)
-    reading_edges_set |= to_read_edge_set
-"""
+def _node_list_to_slice_and_index_message(node_list, csc_map, num_messages, device):
+    for dst_node in node_list:
+        is_isolated = True
+        # for torch_scatter
+        index_tensor = torch.ones(num_messages, dtype=torch.long, device=device) * (-1)
+
+        src_nodes = csc_map.getcol(dst_node).nonzero()[0]
+
+        write_messages_index_list, read_messages_index_list = [], []
+        for src_node in src_nodes:
+            col = csc_map.getcol(src_node)
+            col[dst_node, 0] = 0
+            col.eliminate_zeros()
+            src_index = col.data
+            if src_index.size == 0:  # if no messages
+                continue
+            else:
+                is_isolated = False
+                src_index = torch.tensor(src_index, dtype=torch.long, device=device)
+                dst_index = int(csc_map[src_node, dst_node])
+                index_tensor[src_index] = dst_index
+                read_messages_index_list.append(src_index)
+                write_messages_index_list.append(dst_index)
+
+        if is_isolated:
+            empty_tensor = torch.tensor([], dtype=torch.long, device=device)
+            yield empty_tensor, empty_tensor, empty_tensor
+        else:
+            # for reading message_map
+            write_messages_slice = torch.unique(torch.tensor(write_messages_index_list, device=device), sorted=True)
+            # for updating message_map
+            read_messages_slice = torch.unique(torch.cat(read_messages_index_list), sorted=True)
+            # clean up
+            index_tensor = index_tensor[index_tensor != -1]
+            yield write_messages_slice, read_messages_slice, index_tensor
+
+
+def _node_list_to_slice_and_index_psi(node_list, csc_map, num_messages, device):
+    for dst_node in node_list:
+        # for torch_scatter
+        index_tensor = torch.ones(num_messages, dtype=torch.long, device=device) * (-1)
+
+        col = csc_map.getcol(dst_node)
+        src_index = col.data
+        if src_index.size == 0:  # if no messages
+            empty_tensor = torch.tensor([], dtype=torch.long, device=device)
+            yield empty_tensor, empty_tensor, empty_tensor
+        else:
+            src_index = torch.tensor(src_index, dtype=torch.long, device=device)
+            dst_index = int(dst_node)
+            index_tensor[src_index] = dst_index
+            # for reading message_map
+            write_messages_slice = torch.tensor([dst_index], device=device)
+            # for updating message_map
+            read_messages_slice = src_index
+            # clean up
+            index_tensor = index_tensor[index_tensor != -1]
+            yield write_messages_slice, read_messages_slice, index_tensor

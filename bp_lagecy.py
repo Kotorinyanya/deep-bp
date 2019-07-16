@@ -1,6 +1,9 @@
 import concurrent.futures
 import logging
 import time
+from multiprocessing.pool import Pool
+
+from tqdm import tqdm
 
 from utils import *
 
@@ -116,3 +119,194 @@ def init_messages_legacy(self):
         message_map_at_i = message_map_at_i / message_map_at_i.sum(1).reshape(-1, 1)
         message_map.append(message_map_at_i)
     return message_map
+
+
+def _create_slice_and_index_mp(self):
+    _update_message_slice_and_index, _update_psi_slice_and_index = [], []
+    with Pool() as p:
+        for result in (
+                tqdm(p.imap(self._create_slice_and_index_mp, self.job_list),
+                     desc="create slice and index mp",
+                     total=len(self.job_list)
+                     ) if self.verbose_init else
+                p.imap(self._create_slice_and_index_mp, self.job_list)
+        ):
+            _update_message_slice_and_index.append(result[0])
+            _update_psi_slice_and_index.append(result[1])
+    return _update_message_slice_and_index, _update_psi_slice_and_index
+
+
+def __create_slice_and_index_mp(self, job):
+    edge_list, node_list = job
+    return _update_message_create_slice(self, edge_list), _update_psi_create_index(self, node_list)
+
+
+class BPJob(object):
+
+    def __init__(self, max_job_count):
+        self.max_job_count = max_job_count
+        self.writing_edges_set = set()
+        self.reading_edges_set = set()
+        self.writing_nodes_set = set()
+
+    def __len__(self):
+        return len(self.writing_edges_set)
+
+    def add_job(self, write_edge, write_node, read_edges):
+        self.writing_edges_set.add(write_edge)
+        self.writing_nodes_set.add(write_node)
+        self.reading_edges_set |= read_edges
+
+    def check_is_full(self):
+        if len(self.writing_nodes_set) >= self.max_job_count:
+            return True
+        return False
+
+    def check_writable(self, edge_to_write):
+        i, j = edge_to_write
+        if edge_to_write in self.reading_edges_set \
+                or j in self.writing_nodes_set:
+            return False
+        return True
+
+    def check_readable(self, edges_to_read):
+        if common_member(edges_to_read, self.writing_edges_set):
+            return False
+        return True
+
+    def get_job(self):
+        return self.writing_edges_set, self.writing_nodes_set
+
+
+def _create_job_list_parallel(adj, todo_list, max_node_count, seed, verbose):
+    """
+
+    :param adj: csr_matrix
+    :param todo_list: edges
+    :param max_node_count:
+    :param seed:
+    :param bp_type:
+    :param verbose:
+    :return:
+    """
+    np.random.seed(seed)
+    # set is faster than list to do subtraction
+    todo_set, doing_set = set(todo_list), set()
+    bp_job_empty_list = [BPJob(max_node_count)]
+    bp_job_full_list = []
+
+    for edge_to_write in (tqdm(todo_set, desc="todo_set") if verbose else todo_set):
+        succeed = False
+        i, j = edge_to_write  # i -> j
+
+        for num, bp_job in enumerate(list(bp_job_empty_list)):
+            edges_to_read = set(zip(*adj.getrow(i).nonzero()))
+            # edges_to_read = set((k, i) for k in G.neighbors(i) if k != j)
+            if not bp_job.check_writable(edge_to_write):
+                continue
+            elif not bp_job.check_readable(edges_to_read):
+                continue
+            else:
+                succeed = True
+                break
+
+        if not succeed:
+            new_bp_job = BPJob(max_node_count)
+            new_bp_job.add_job(edge_to_write, j, edges_to_read)
+            bp_job_empty_list.append(new_bp_job)
+        else:
+            bp_job.add_job(edge_to_write, j, edges_to_read)
+            if bp_job.check_is_full():
+                bp_job_empty_list.remove(bp_job)
+                bp_job_full_list.append(bp_job)
+    job_list = [job.get_job() for job in bp_job_full_list + bp_job_empty_list]
+
+    return job_list
+
+
+# before optimization
+def __create_job_list_parallel(G, todo_list, parallel_max_edges, seed, bp_type, verbose):
+    np.random.seed(seed)
+    # set is faster than list to do subtraction
+    todo_set, doing_set = set(todo_list), set()
+    job_list = []
+    if verbose:
+        pbar = tqdm(total=len(todo_set), desc="todo_set")
+    while len(todo_set) > 0:
+        writing_edges_set, reading_edges_set, writing_nodes_set = set(), set(), set()
+        # avoid racing
+        for i_to_j in todo_set:
+            i, j = i_to_j
+            if i_to_j in reading_edges_set or j in writing_nodes_set:
+                continue
+            if bp_type == 'approximate':
+                to_read_edge_set = set((k, i) for k in G.neighbors(i) if k != j)
+            elif bp_type == 'exact':
+                to_read_edge_set = set((k, i) for k in G.nodes() if k not in [i, j])
+            if common_member(to_read_edge_set, writing_edges_set):
+                continue
+            writing_edges_set.add(i_to_j)
+            writing_nodes_set.add(j)
+            reading_edges_set |= to_read_edge_set
+            if len(writing_edges_set) > parallel_max_edges:
+                break
+        todo_set -= writing_edges_set
+        doing_set |= writing_edges_set
+        job_list.append((writing_edges_set, writing_nodes_set))
+
+        if verbose:
+            pbar.update(len(writing_edges_set))
+    if verbose:
+        pbar.close()
+    return job_list
+
+
+def _update_message_create_slice(self, edge_list):
+    # for updating message_map
+    write_messages_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
+    # for reading message_map
+    read_messages_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
+    # for torch_scatter
+    index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
+                   (-1)  # a trick
+
+    # O(mk)
+    for src_node, dst_node in edge_list:
+        src_to_dst_message_index = self.message_to_index_map[(src_node, dst_node)]
+        if self.bp_type == 'approximate':
+            src_message_indexes = [self.message_to_index_map[(k, src_node)]
+                                   for k in self.adjacency_matrix.getrow(src_node).nonzero()[1]
+                                   if k != dst_node]
+            if len(src_message_indexes) > 0:
+                write_messages_slice_tensor[src_to_dst_message_index] = 1
+                read_messages_slice_tensor[src_message_indexes] = 1
+                index_tensor[src_message_indexes] = src_to_dst_message_index
+
+        elif self.bp_type == 'exact':
+            raise NotImplementedError()
+    # assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(write_messages_slice_tensor).max()
+    index_tensor = index_tensor[index_tensor != -1]  # remove redundant indexes
+    return write_messages_slice_tensor, read_messages_slice_tensor, index_tensor
+
+
+def _update_psi_create_index(self, nodes):
+    # for updating marginal_psi
+    write_nodes_slice_tensor = torch.zeros(self.num_nodes, dtype=torch.uint8, device=self.beta.device)
+    # for reading messages
+    read_message_slice_tensor = torch.zeros(self.num_messages, dtype=torch.uint8, device=self.beta.device)
+    # for torch_scatter
+    index_tensor = torch.ones(self.num_messages, dtype=torch.long, device=self.beta.device) * \
+                   (-1)  # a trick
+
+    # O(nk)
+    for dst_node in nodes:
+        write_nodes_slice_tensor[dst_node] = 1  # mark message to write
+        src_message_indexes = [self.message_to_index_map[(src_node, dst_node)]
+                               for src_node in self.adjacency_matrix.getrow(dst_node).nonzero()[1]]
+        if len(src_message_indexes) > 0:
+            index_tensor[src_message_indexes] = int(dst_node)  # index message to read for torch_scatter
+            read_message_slice_tensor[src_message_indexes] = 1  # for slicing input message
+
+    # assert index_tensor.max() == -1 or index_tensor.max() == torch.nonzero(write_nodes_slice_tensor).max()
+    index_tensor = index_tensor[index_tensor != -1]  # remove redundant indexes
+    return write_nodes_slice_tensor, read_message_slice_tensor, index_tensor
