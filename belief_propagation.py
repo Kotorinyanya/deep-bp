@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -11,10 +12,13 @@ import numpy as np
 import torch
 from torch import nn
 from tqdm import tqdm
-from multiprocessing import Pool
+from torch_geometric.datasets import KarateClub, Reddit
+from multiprocessing import Pool, Manager
+import torch.multiprocessing as mp
 
-from bp_helper import _create_job_list_parallel_fast, _node_list_to_slice_and_index_message, \
-    _node_list_to_slice_and_index_psi
+from bp_helper import create_job_list_parallel_fast, _node_to_slice_and_index_message, \
+    _node_to_slice_and_index_psi, _update_manager_node_dd, node_list_to_slice_and_index_message, \
+    node_list_to_slice_and_index_psi, save_node_list_dict, _save_node_dict
 from bp_lagecy import *
 from bp_helper import *
 from bp_lagecy import _create_job_list_parallel, _update_message_create_slice, _update_psi_create_index
@@ -40,7 +44,14 @@ class BeliefPropagation(nn.Module):
                  summary_writer=None,
                  disable_gradient=False,
                  bp_init_type='new',
-                 save_job=True,
+                 multi_processing=False,
+                 save_node_dict=False,
+                 node_job_slice=None,
+                 save_full_init=False,
+                 mp_chunksize=2,
+                 mp_processes_count=4,
+                 save_init_path='saved/',
+                 dataset_unique_name='',
                  seed=0):
         """
         Belief Propagation for pooling on graphs
@@ -61,21 +72,32 @@ class BeliefPropagation(nn.Module):
                                 few value means faster inference, large value means worse approximation (h)
         :param summary_writer: TensorBoardX
         :param disable_gradient: to save memory for large number of iterations
+        :param node_job_slice: for parallel init
         :param seed:
         """
 
         super(BeliefPropagation, self).__init__()
 
-        self.save_job = save_job
-        self.bp_init_type = bp_init_type
+        self.node_job_slice = node_job_slice
         if disable_gradient and bp_implementation_type == 'legacy':
             raise NotImplementedError()
         assert bp_type in ['exact', 'approximate']
         assert bp_implementation_type in ['parallel', 'legacy']
+        assert bp_init_type in ['old', 'new']
+        if save_node_dict or save_full_init:
+            assert len(dataset_unique_name) > 0
         if bp_implementation_type == 'parallel':
             global scatter_mul
             from torch_scatter import scatter_mul
 
+        self.save_full_init = save_full_init
+        self.save_node_dict = save_node_dict
+        self.multi_processing = multi_processing
+        self.dataset_unique_name = dataset_unique_name
+        self.save_init_path = save_init_path
+        self.mp_processes_count = mp_processes_count if mp_processes_count is not None else os.cpu_count()
+        self.mp_chunksize = mp_chunksize
+        self.bp_init_type = bp_init_type
         self.bp_type = bp_type
         self.bp_implementation_type = bp_implementation_type
         self.disable_gradient = disable_gradient
@@ -115,12 +137,21 @@ class BeliefPropagation(nn.Module):
             beta = torch.tensor(beta, dtype=torch.float)
             self.is_beta_init = True
         else:
-            raise Exception("What are u doing???")
+            raise Exception("What???")
         self.beta = nn.Parameter(data=beta, requires_grad=(True if not self.disable_gradient else False))
 
         # self.logger.info('\t mean_degree \t {0:.2f} \t beta \t {1} \t '.format(mean_degree, self.beta.data.item()))
         self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
+        # initialized later on calling forward
+        self.G, self.adjacency_matrix = None, None
+        self.mean_w, self.num_nodes, self.mean_degree, self.is_weighted = None, None, None, None
+        self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
+        self.node_id_to_index, self.num_messages, self.message_index_set, self.dok_map = None, None, None, None
+        self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
+        self.dok_map, self.csc_map = None, None
+        self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
+        self._saved_message_update_dict, self._saved_psi_update_dict = None, None
         self.is_init, self.global_step = False, 0
 
     def forward(self, edge_index, edge_attr=None):
@@ -144,8 +175,30 @@ class BeliefPropagation(nn.Module):
             raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP"
                             .format(self.beta.data))
 
-        return self.message_map, self.marginal_psi, \
-               self.message_index_set if self.bp_init_type == 'old' else self.csc_map
+        return self.message_map, self.marginal_psi, self.dok_map
+
+    def init_bp(self, edge_index, edge_attr=None):
+        # seed for a stable gradient descent
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+
+        if self.is_init:
+            # check if the graph changes
+            if not (torch.all(torch.eq(edge_index, self.edge_index)) and
+                    torch.all(torch.eq(edge_attr, self.edge_attr))):
+                self.is_init = False
+
+        if not self.is_init:
+            if self.save_full_init:
+                self._init_bp_with_save(edge_index, edge_attr)
+            else:
+                self._init_bp(edge_index, edge_attr)
+            self.is_init = True
+
+        # messages need to be initialized every single run with the same random value (for gradients)
+        self._init_messages()
+
+        self.logger.info("BP Initialization Completed")
 
     def bp_logging(self, num_iter, max_diff):
         is_converged = True if max_diff < self.bp_max_diff else False
@@ -174,151 +227,6 @@ class BeliefPropagation(nn.Module):
         if (self.beta < 0.05).sum() > 0:
             self.logger.critical("P:beta={0}, indicating paramagnetic phase in BP, "
                                  "please consider adding the weight for entropy_loss".format(self.beta.data))
-
-    def init_bp(self, edge_index, edge_attr=None):
-        """
-
-        :param edge_index:
-        :param edge_attr:
-        :return:
-        """
-
-        # seed for a stable gradient descent
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-
-        if self.is_init:
-            # if not csr_matrix_equal(csr_matrix(adjacency_matrix).astype(np.float), self.adjacency_matrix):
-            if not (torch.all(torch.eq(edge_index, self.edge_index)) and
-                    torch.all(torch.eq(edge_attr, self.edge_attr))):
-                # if the input adjacency_matrix changes, job_list need to be re initialized
-                self.is_init = False
-        if not self.is_init:
-            self.logger.info("Initializing BP")
-            self.adjacency_matrix = edge_index_to_csr(edge_index, edge_attr)
-            if edge_attr is not None:
-                rand_int = np.random.randint(edge_index.shape[1])
-                assert edge_attr.shape[1] == 1
-                edge_attr = edge_attr.reshape(-1)
-                # check edge_index and edge_attr is in ascending order:
-                assert self.adjacency_matrix[edge_index[0, rand_int], edge_index[1, rand_int]] == edge_attr[rand_int]
-            # check if symmetric
-            assert self.adjacency_matrix[0, 1] == self.adjacency_matrix[1, 0]
-            if self.bp_implementation_type == 'legacy':
-                self.G = nx.to_networkx_graph(self.adjacency_matrix)
-            self.num_nodes = self.adjacency_matrix.shape[0]
-            self.mean_w = self.adjacency_matrix.mean()
-            self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
-
-            self.logger.info("Initializing Message Indexes")
-            if self.bp_init_type == 'new':
-                self.csc_map = adj_to_csc_map(self.adjacency_matrix)
-                self.num_messages = self.adjacency_matrix.count_nonzero() + 1  # plus one for csr_map starts with 1
-            if self.bp_init_type == 'old':
-                self.message_to_index_map = {e: i for i, e in enumerate(
-                    tqdm(zip(*self.adjacency_matrix.nonzero()), desc="indexes",
-                         total=self.adjacency_matrix.count_nonzero())
-                    if self.verbose_init else
-                    zip(*self.adjacency_matrix.nonzero())
-                )}
-                self.message_index_set = set(self.message_to_index_map.keys())  # set is way more faster than list
-                self.num_messages = len(self.message_index_set)
-            self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
-                                              if self.parallel_max_node_percent is None else
-                                              self.parallel_max_node_percent)
-            self.w_indexed = torch.stack([(edge_attr
-                                           if edge_attr is not None else
-                                           torch.ones(edge_index.shape[1], dtype=torch.float, device=self.beta.device))
-                                          for _ in range(self.num_groups)]).reshape(-1, self.num_groups)
-            if self.bp_init_type == 'new':
-                self.w_indexed = torch.cat(
-                    [torch.ones(1, self.num_groups, dtype=torch.float, device=self.beta.device), self.w_indexed],
-                    dim=0)
-
-        self.logger.info("Initializing Messages")
-        # initialize psi
-        self.marginal_psi = torch.rand(self.num_nodes, self.num_groups,
-                                       device=self.beta.device)  # the marginal probability of node i
-        self.marginal_psi = self.marginal_psi / self.marginal_psi.sum(1).reshape(-1, 1)
-        # initialize message
-        if self.bp_implementation_type == 'parallel':
-            self.message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
-            self.message_map = self.message_map / self.message_map.sum(1).reshape(-1, 1)
-        elif self.bp_implementation_type == 'legacy':
-            self.message_map = init_messages_legacy(self)
-        # initialize external field
-        self.h = (-self.beta * self.mean_w * (
-            self.marginal_psi.clone()
-            if not self.disable_gradient else
-            self.marginal_psi
-        )).sum(0)
-
-        if not self.is_init:
-            if not self.is_beta_init:
-                self.logger.warning("Initializing beta again with "
-                                    "'torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)'")
-                beta = torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)
-                beta = beta if not torch.isnan(beta).sum() > 0 else torch.tensor(1.0, dtype=torch.float)  # nan
-                self.beta.data = beta
-                self.logger.warning('beta initialized to {0}'.format(self.beta.data))
-
-            if self.bp_implementation_type == 'legacy':
-                # multi-thread synchronization using lock
-                self._lock_psi = [threading.Lock() for _ in range(len(self.marginal_psi))]
-                self._lock_mmap = [[threading.Lock() for _ in range(len(mmap))] for mmap in self.message_map]
-                self._lock_h = threading.Lock()
-            elif self.bp_implementation_type == 'parallel':
-                self.logger.info("Initializing Job List")
-                if self.bp_init_type == 'old':
-                    # job_list to avoid race, job -> (edges, nodes)
-                    self.job_list = _create_job_list_parallel(
-                        self.adjacency_matrix, self.message_index_set,
-                        self.parallel_max_node_percent * self.num_nodes,
-                        self.seed, self.verbose_init
-                    )
-                    self.logger.info("Creating slice and index")
-                    # self._update_message_slice_and_index, self._update_psi_slice_and_index = \
-                    #     self.create_slice_and_index_mp()
-                    self._update_message_slice_and_index = [_update_message_create_slice(self, job[0])
-                                                            for job in (tqdm(self.job_list, desc="create message slice")
-                                                                        if self.verbose_init else self.job_list)]
-                    self._update_psi_slice_and_index = [_update_psi_create_index(self, job[1])
-                                                        for job in (tqdm(self.job_list, desc="create psi slice")
-                                                                    if self.verbose_init else self.job_list)]
-                if self.bp_init_type == 'new':
-                    self.job_list = _create_job_list_parallel_fast(self.csc_map,
-                                                                   self.parallel_max_node_percent * self.num_nodes,
-                                                                   self.seed,
-                                                                   self.verbose_init)
-                    if self.save_job:
-                        iter_items = enumerate(_node_list_to_slice_and_index_message(
-                            range(self.num_nodes), self.csc_map, self.num_messages,
-                            self.beta.device
-                        ))
-                        self._saved_message_update_dict = {
-                            n: (w, r, i)
-                            for n, (w, r, i) in (
-                                tqdm(iter_items, desc="message update dict", total=self.num_nodes)
-                                if self.verbose_init else
-                                iter_items
-                            )
-                        }
-                        iter_items = enumerate(_node_list_to_slice_and_index_psi(
-                            range(self.num_nodes), self.csc_map, self.num_messages,
-                            self.beta.device
-                        ))
-                        self._saved_psi_update_dict = {
-                            n: (w, r, i)
-                            for n, (w, r, i) in (
-                                tqdm(iter_items, desc="psi update dict", total=self.num_nodes)
-                                if self.verbose_init else
-                                iter_items
-                            )
-                        }
-
-            self.is_init = True
-
-        self.logger.info("BP Initialization Completed")
 
     def bp_infer_parallel(self):
         """
@@ -375,7 +283,13 @@ class BeliefPropagation(nn.Module):
             self.message_map[read_messages_slice_tensor].clone()
             if not self.disable_gradient else
             self.message_map[read_messages_slice_tensor]
-        ) * (torch.exp(self.beta * self.w_indexed[read_messages_slice_tensor]) - 1)
+        ) * (torch.exp(
+            self.beta * (
+                self.w_indexed[read_messages_slice_tensor]
+                if self.is_weighted else
+                1
+            )
+        ) - 1)
         out = self.marginal_psi.new_ones((self.num_nodes, self.num_groups))
         out = scatter_mul(src, index_tensor, out=out, dim=0)
         out = out[write_nodes_slice_tensor]
@@ -405,7 +319,13 @@ class BeliefPropagation(nn.Module):
             self.message_map[read_messages_slice_tensor].clone()
             if not self.disable_gradient else
             self.message_map[read_messages_slice_tensor]
-        ) * (torch.exp(self.beta * self.w_indexed[read_messages_slice_tensor]) - 1)
+        ) * (torch.exp(
+            self.beta * (
+                self.w_indexed[read_messages_slice_tensor]
+                if self.is_weighted else
+                1
+            )
+        ) - 1)
         out = self.message_map.new_ones((self.num_messages, self.num_groups))
         out = scatter_mul(src, index_tensor, out=out, dim=0)
         out = out[write_messages_slice_tensor]
@@ -417,33 +337,292 @@ class BeliefPropagation(nn.Module):
         self.message_map[write_messages_slice_tensor] = out
         return max_diff
 
-    def init_messages(self):
-        message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
-        message_map = message_map / message_map.sum(1).reshape(-1, 1)
-        return message_map
+    """ ----------------------------------------------------------- """
+    """ BP needs a very complicated initialization to run very fast """
+    """ ----------------------------------------------------------- """
 
-    def init_node_w(self):
+    @use_logging(level='info')
+    def _init_bp_with_save(self, edge_index, edge_attr):
+        try:
+            self._load_bp_init()
+            self.logger.info("Succeed to load BP Job from file, skipping init...")
+        except Exception as e:
+            self.logger.info(e)
+            self.logger.info("Failed to load BP Job from file, running init...")
+            self._init_bp(edge_index, edge_attr)
+            try:
+                self._save_bp_init()
+                self.logger.info("Saved BP Job to {}".format(self.save_init_path))
+            except Exception as e:
+                self.logger.info(e)
+                self.logger.info("Failed to save BP Job to file")
 
-        w_indexed = torch.tensor([
-            self.adjacency_matrix[i, j] for k, (i, j) in (
-                tqdm(self.message_to_index_map_inverse.items(), desc="w_indexed")
+    @use_logging(level='info')
+    def _init_bp(self, edge_index, edge_attr):
+        self._init_graph(edge_index, edge_attr)
+        if self.bp_init_type == 'new':
+            self._init_message_indexes_new()
+        if self.bp_init_type == 'old':
+            self._init_message_indexes_old()
+        if not self.is_beta_init:
+            self._init_beta()
+        if self.bp_implementation_type == 'legacy':
+            self._init_lock_legacy()
+        elif self.bp_implementation_type == 'parallel':
+            if self.bp_init_type == 'old':
+                self._init_job_list_old()
+            if self.bp_init_type == 'new':
+                self._init_job_list_new()
+
+    @use_logging(level='info')
+    def _load_bp_init(self):
+        with open(osp.join(self.save_init_path, self.dataset_unique_name), 'rb') as inf:
+            saved_obj = torch.load(inf)
+            self.__dict__.update(saved_obj.__dict__)
+
+    @use_logging(level='info')
+    def _save_bp_init(self):
+        with open(osp.join(self.save_init_path, self.dataset_unique_name), 'wb') as ouf:
+            torch.save(self, ouf)
+
+    @use_logging(level='info')
+    def _init_graph(self, edge_index, edge_attr):
+        self.adjacency_matrix = edge_index_to_csr(edge_index, edge_attr)
+        if edge_attr is not None:
+            rand_int = np.random.randint(edge_index.shape[1])
+            assert edge_attr.shape[1] == 1
+            edge_attr = edge_attr.reshape(-1)
+            # check edge_index and edge_attr is in ascending order:
+            assert self.adjacency_matrix[edge_index[0, rand_int], edge_index[1, rand_int]] == edge_attr[rand_int]
+            # TODO: size num_groups in w is still dummy
+            self.w_indexed = torch.stack([edge_attr for _ in range(self.num_groups)]).reshape(-1, self.num_groups)
+            if self.bp_init_type == 'new':  # dummy at 0
+                self.w_indexed = torch.cat(
+                    [torch.ones(1, self.num_groups, dtype=torch.float, device=self.beta.device), self.w_indexed],
+                    dim=0)
+            self.is_weighted = True
+        else:
+            self.is_weighted = False
+        # check if symmetric
+        assert self.adjacency_matrix[0, 1] == self.adjacency_matrix[1, 0]
+        if self.bp_implementation_type == 'legacy':  # deprecated
+            self.logger.warning("legacy is deprecated")
+            self.G = nx.to_networkx_graph(self.adjacency_matrix)
+        self.num_nodes = self.adjacency_matrix.shape[0]
+        self.mean_w = self.adjacency_matrix.mean()
+        self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
+        self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
+                                          if self.parallel_max_node_percent is None else
+                                          self.parallel_max_node_percent)
+
+    @use_logging(level='info')
+    def _init_message_indexes_new(self):
+        self.csc_map, row, col, data = adj_to_csc_map(self.adjacency_matrix)
+        iter_items = tqdm(zip(*(row, col, data)), total=data.size, desc="dok_map") \
+            if self.verbose_init else \
+            zip(*(row, col, data))
+        self.dok_map = {(i, j): n for i, j, n in iter_items}
+        self.num_messages = self.adjacency_matrix.count_nonzero() + 1  # plus one for csr_map starts with 1
+
+    @use_logging(level='info')
+    def _init_message_indexes_old(self):
+        self.dok_map = {e: i for i, e in enumerate(
+            tqdm(zip(*self.adjacency_matrix.nonzero()), desc="indexes",
+                 total=self.adjacency_matrix.count_nonzero())
+            if self.verbose_init else
+            zip(*self.adjacency_matrix.nonzero())
+        )}
+        self.message_index_set = set(self.dok_map.keys())  # set is way more faster than list
+        self.num_messages = len(self.message_index_set)
+
+    @use_logging(level='info')
+    def _init_messages(self):
+        # initialize psi
+        self.marginal_psi = torch.rand(self.num_nodes, self.num_groups,
+                                       device=self.beta.device)  # the marginal probability of node i
+        self.marginal_psi = self.marginal_psi / self.marginal_psi.sum(1).reshape(-1, 1)
+        # initialize message
+        if self.bp_implementation_type == 'parallel':
+            self.message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
+            self.message_map = self.message_map / self.message_map.sum(1).reshape(-1, 1)
+        elif self.bp_implementation_type == 'legacy':
+            self.message_map = init_messages_legacy(self)
+        # initialize external field
+        self.h = (-self.beta * self.mean_w * (
+            self.marginal_psi.clone()
+            if not self.disable_gradient else
+            self.marginal_psi
+        )).sum(0)
+
+    @use_logging(level='info')
+    def _init_beta(self):
+        self.logger.warning("Initializing beta again with "
+                            "'torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)'")
+        beta = torch.log(self.num_groups / (torch.sqrt(self.mean_degree) - 1) + 1)
+        beta = beta if not torch.isnan(beta).sum() > 0 else torch.tensor(1.0, dtype=torch.float)  # nan
+        self.beta.data = beta
+        self.logger.warning('beta initialized to {0}'.format(self.beta.data))
+
+    @use_logging(level='info')
+    def _init_lock_legacy(self):
+        # multi-thread synchronization using lock
+        self._lock_psi = [threading.Lock() for _ in range(len(self.marginal_psi))]
+        self._lock_mmap = [[threading.Lock() for _ in range(len(mmap))] for mmap in self.message_map]
+        self._lock_h = threading.Lock()
+
+    @use_logging(level='info')
+    def _init_job_list_old(self):
+        # job_list to avoid race, job -> (edges, nodes)
+        self.job_list = _create_job_list_parallel(
+            self.adjacency_matrix, self.message_index_set,
+            self.parallel_max_node_percent * self.num_nodes,
+            self.seed, self.verbose_init
+        )
+        self._init_job_indexes_slices()
+
+    @use_logging(level='info')
+    def _init_job_indexes_slices(self):
+        self._update_message_slice_and_index = [_update_message_create_slice(self, job[0])
+                                                for job in (tqdm(self.job_list, desc="create message slice")
+                                                            if self.verbose_init else self.job_list)]
+        self._update_psi_slice_and_index = [_update_psi_create_index(self, job[1])
+                                            for job in (tqdm(self.job_list, desc="create psi slice")
+                                                        if self.verbose_init else self.job_list)]
+
+    @use_logging(level='info')
+    def _init_job_list_new(self):
+        if self.multi_processing:
+            if self.save_node_dict:
+                self.__init_node_update_slice_dict_mp_save()
+            else:
+                self.__init_node_update_slice_dict_new_mp()
+        else:
+            if self.save_node_dict:
+                self.__init_node_update_slice_dict_new_save()
+            else:
+                self.__init_node_update_slice_dict_new()
+        self.job_list = create_job_list_parallel_fast(
+            self.csc_map, self.parallel_max_node_percent * self.num_nodes, self.seed, self.verbose_init)
+
+    @use_logging(level='info')
+    def __init_node_update_slice_dict_new_save(self):
+        all_nodes = list(range(self.num_nodes))
+        all_nodes = all_nodes[self.node_job_slice] if self.node_job_slice is not None else all_nodes
+        todo_list = self.__load_node_dict_(all_nodes)
+        if len(todo_list) > 0:
+            parent_path = osp.join(self.save_init_path, self.dataset_unique_name)
+            for dst_node in (tqdm(todo_list) if self.verbose_init else todo_list):
+                save_path = parent_path + '-node-{0}'.format(dst_node)
+                _save_node_dict(self.csc_map, self.dok_map, self.num_messages, self.beta.device, dst_node, save_path)
+
+            if len(self.__load_node_dict_(todo_list)) > 0:
+                raise Exception("Failed to load saved node dicts")
+
+    @use_logging(level='info')
+    def __init_node_update_slice_dict_new(self):
+        iter_items = enumerate(node_list_to_slice_and_index_message(
+            range(self.num_nodes), self.csc_map, self.dok_map, self.num_messages,
+            self.beta.device
+        ))
+        self._saved_message_update_dict = {
+            n: (w, r, i)
+            for n, (w, r, i) in (
+                tqdm(iter_items, desc="message update dict", total=self.num_nodes)
                 if self.verbose_init else
-                self.message_to_index_map_inverse.items()
-            )], device=self.beta.device)
-        w_indexed = torch.stack([w_indexed for _ in range(self.num_groups)], dim=-1)
+                iter_items
+            )
+        }
+        iter_items = enumerate(node_list_to_slice_and_index_psi(
+            range(self.num_nodes), self.csc_map, self.num_messages,
+            self.beta.device
+        ))
+        self._saved_psi_update_dict = {
+            n: (w, r, i)
+            for n, (w, r, i) in (
+                tqdm(iter_items, desc="psi update dict", total=self.num_nodes)
+                if self.verbose_init else
+                iter_items
+            )
+        }
 
-        return w_indexed
+    @use_logging(level='info')
+    def __init_node_update_slice_dict_new_mp(self):
+        with Manager() as manager:
+            dd = manager.dict()
+            dd['message'], dd['psi'] = manager.dict(), manager.dict()
+            with Pool(processes=self.mp_processes_count) as p:
+                func = partial(_update_manager_node_dd,
+                               dd, self.csc_map, self.dok_map, self.num_messages, self.beta.device)
+                # chunksize = np.ceil(self.num_nodes / os.cpu_count() / 10)
+                iter_items = p.imap_unordered(func, range(self.num_nodes),
+                                              chunksize=self.mp_chunksize)
+                if self.verbose_init:
+                    with tqdm(total=self.num_nodes, desc="nodes") as pbar:
+                        for _ in iter_items:
+                            pbar.update()
+                else:
+                    _ = list(iter_items)
 
-    def __repr__(self):
-        return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
-            self.__class__.__name__, self.num_groups, self.max_num_iter, self.bp_max_diff, self.bp_dumping_rate)
+            self._saved_message_update_dict = dd['message'].copy()
+            self._saved_psi_update_dict = dd['psi'].copy()
+
+    @use_logging(level='info')
+    def __init_node_update_slice_dict_mp_save(self):
+        all_nodes = list(range(self.num_nodes))
+        todo_list = self.__load_node_dict_(all_nodes)
+        if len(todo_list) > 0:
+            # mp save
+            ctx = mp.get_context('spawn')
+            chucks = np.array_split(todo_list, self.mp_processes_count)
+            workers = [ctx.Process(
+                target=save_node_list_dict,
+                args=(self.csc_map, self.dok_map, self.num_messages, self.beta.device, node_list,
+                      osp.join(self.save_init_path, self.dataset_unique_name))
+            ) for node_list in chucks]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+
+            if len(self.__load_node_dict_(todo_list)) > 0:
+                raise Exception("Failed to load saved node dicts")
+
+    @use_logging(level='info')
+    def __load_node_dict_(self, todo_list):
+        self._saved_message_update_dict, self._saved_psi_update_dict = dict(), dict()
+        failed_nodes = []
+        with tqdm(desc="load node dict", total=len(todo_list), disable=(not self.verbose_init)) as pbar:
+            for node in todo_list:
+                try:
+                    saved_path = osp.join(self.save_init_path, self.dataset_unique_name) + '-node-{0}'.format(node)
+                    # TODO: check but not load
+                    d = torch.load(saved_path)
+                    if self.beta.device == 'cpu':
+                        self._saved_message_update_dict[node] = d[node]['message']
+                        self._saved_psi_update_dict[node] = d[node]['psi']
+                    else:
+                        self._saved_message_update_dict[node] = tuple(
+                            t.to(self.beta.device) for t in d[node]['message'])
+                        self._saved_psi_update_dict[node] = tuple(t.to(self.beta.device) for t in d[node]['psi'])
+                    pbar.update()
+                except Exception as e:
+                    failed_nodes.append(node)
+                    continue
+        if len(failed_nodes) > 0:
+            self.logger.info("nodes failed to load from file: {}".format(len(failed_nodes)))
+        return failed_nodes
+
+
+def __repr__(self):
+    return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
+        self.__class__.__name__, self.num_groups, self.max_num_iter, self.bp_max_diff, self.bp_dumping_rate)
 
 
 if __name__ == '__main__':
     num_groups = 2
     sizes = np.asarray([50] * num_groups)
     epslion = 0.3
-    P = np.ones((num_groups, num_groups)) * 0.01
+    P = np.ones((num_groups, num_groups)) * 0.1
     for i in range(len(P)):
         P[i][i] = P[i][i] / epslion
     G = nx.stochastic_block_model(sizes, P, seed=0)
@@ -459,14 +638,22 @@ if __name__ == '__main__':
     percent = 1 / np.sqrt(c + 1)
     print(percent)
 
+    reddit = Reddit('datasets/Reddit')
+    num_groups = int(reddit.data.y.max() - reddit.data.y.min())
+    edge_index = reddit.data.edge_index
+    ground_truth = reddit.data.y
+
     bp = BeliefPropagation(num_groups, mean_degree=None, verbose_iter=True,
-                           max_num_iter=100,
-                           parallel_max_node_percent=0.2,
+                           max_num_iter=100, verbose_init=True,
+                           parallel_max_node_percent=0.1,
                            bp_max_diff=1e-2, disable_gradient=True,
-                           bp_init_type='new', save_job=True)
+                           bp_init_type='new', save_node_dict=True,
+                           save_full_init=False,
+                           mp_chunksize=1, mp_processes_count=4,
+                           dataset_unique_name='reddit', node_job_slice=slice(1, 50000, 1))
     # bp.beta.data = torch.tensor(1.75)
     entropy = EntropyLoss()
-    # bp = bp.cuda()
+    bp = bp.cuda()
     message_map, marginal_psi, message_index_list = bp(edge_index)
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)

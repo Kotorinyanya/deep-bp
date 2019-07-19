@@ -1,4 +1,7 @@
+from functools import reduce
+
 import torch
+import logging
 from torch import nn
 import numpy as np
 from itertools import permutations, product
@@ -6,6 +9,20 @@ import networkx as nx
 from torch_geometric.data import Data
 import os.path as osp
 from scipy.sparse import coo_matrix, csr_matrix
+
+
+def use_logging(level='info'):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            if level == 'warn':
+                logging.warning("%s is running" % func.__name__)
+            elif level == "info":
+                logging.info("%s is running" % func.__name__)
+            return func(*args)
+
+        return wrapper
+
+    return decorator
 
 
 class EntropyLoss(nn.Module):
@@ -169,3 +186,22 @@ def adj_to_edge_index(adj):
     edge_attr = torch.tensor(A.data).unsqueeze(-1)
 
     return edge_index, edge_attr
+
+
+def count_memory(tensors):
+    total = 0
+    for obj in tensors:
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                if len(obj.size()) > 0:
+                    if obj.type() == 'torch.FloatTensor':
+                        total += reduce(lambda x, y: x * y, obj.size()) * 32
+                    elif obj.type() == 'torch.LongTensor':
+                        total += reduce(lambda x, y: x * y, obj.size()) * 64
+                    elif obj.type() == 'torch.IntTensor':
+                        total += reduce(lambda x, y: x * y, obj.size()) * 32
+                    # else:
+                    # Few non-cuda tensors in my case from dataloader
+        except Exception as e:
+            pass
+    print("{} GB".format(total / ((1024 ** 3) * 8)))
