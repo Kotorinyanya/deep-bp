@@ -35,12 +35,12 @@ class EntropyLoss(nn.Module):
         return b
 
 
-def get_model_log_dir(comment):
+def get_model_log_dir(comment, model_name):
     import socket
     from datetime import datetime
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     log_dir = osp.join(
-        current_time + '_' + socket.gethostname() + '_' + comment)
+        current_time + '_' + socket.gethostname() + '_' + comment + '_' + model_name)
     return log_dir
 
 
@@ -152,20 +152,21 @@ def networkx_to_data(G, node_feature_dim=0):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def edge_index_to_csr(edge_index, edge_attr=None):
+def edge_index_to_csr(edge_index, num_nodes, edge_attr=None):
     """
     coo_matrix(coordinate matrix) is fast to get row
-    :param edge_index:
-    :param edge_attr:
+    :param edge_index: Tensor
+    :param num_nodes: int
+    :param edge_attr: Tensor
     :return:
     """
+    shape = (num_nodes, num_nodes)
     if edge_attr is not None:
         assert edge_attr.shape[1] == 1
     edge_attr = edge_attr.reshape(-1) if edge_attr is not None else None
     row, col = edge_index
     data = torch.ones(edge_index.shape[1], dtype=torch.float) if edge_attr is None else edge_attr.float()
-    num_nodes = row.max() + 1
-    adj = csr_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
+    adj = csr_matrix((data.cpu(), (row.cpu(), col.cpu())), shape=shape)
     return adj
 
 

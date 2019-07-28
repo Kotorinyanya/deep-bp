@@ -14,7 +14,7 @@ def adj_to_csc_map(adjacency_matrix):
     """
     row, col = adjacency_matrix.nonzero()
     data = np.arange(adjacency_matrix.count_nonzero()) + 1
-    csc_map = csc_matrix((data, (row, col)))
+    csc_map = csc_matrix((data, (row, col)), shape=adjacency_matrix.shape)
     return csc_map, row, col, data
 
 

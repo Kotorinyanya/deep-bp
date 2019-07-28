@@ -31,16 +31,17 @@ class BeliefPropagation(nn.Module):
     def __init__(self,
                  num_groups,
                  mean_degree=None,
-                 max_num_iter=100,
-                 bp_max_diff=1e-2,
+                 max_num_iter=10,
+                 bp_max_diff=5e-1,
                  bp_dumping_rate=1.0,
-                 num_workers=1,
+                 save_init_path='saved/',
+                 dataset_unique_name='',
                  is_logging=True,
                  verbose_iter=False,
                  verbose_init=True,
                  bp_type='approximate',
                  bp_implementation_type='parallel',
-                 parallel_max_node_percent=None,
+                 parallel_max_node_percent=0.1,
                  summary_writer=None,
                  disable_gradient=False,
                  bp_init_type='new',
@@ -48,10 +49,9 @@ class BeliefPropagation(nn.Module):
                  save_node_dict=False,
                  node_job_slice=None,
                  save_full_init=False,
+                 num_workers=1,
                  mp_chunksize=2,
                  mp_processes_count=4,
-                 save_init_path='saved/',
-                 dataset_unique_name='',
                  seed=0):
         """
         Belief Propagation for pooling on graphs
@@ -153,15 +153,16 @@ class BeliefPropagation(nn.Module):
         self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
         self._saved_message_update_dict, self._saved_psi_update_dict = None, None
         self.is_init, self.global_step = False, 0
+        self.edge_index, self.edge_attr = None, None
 
-    def forward(self, edge_index, edge_attr=None):
+    def forward(self, edge_index, num_nodes, edge_attr=None):
         """
 
         :param edge_index:
         :param edge_attr:
         :return:
         """
-        self.init_bp(edge_index, edge_attr)
+        self.init_bp(edge_index, num_nodes, edge_attr)
 
         if self.bp_implementation_type == 'parallel':
             num_iter, max_diff = self.bp_infer_parallel()
@@ -175,24 +176,27 @@ class BeliefPropagation(nn.Module):
             raise Exception("beta={0}, indicating a paramagnetic (P) phase in BP"
                             .format(self.beta.data))
 
-        return self.message_map, self.marginal_psi, self.dok_map
+        return self.message_map, self.marginal_psi, self.csc_map
 
-    def init_bp(self, edge_index, edge_attr=None):
+    def init_bp(self, edge_index, num_nodes, edge_attr=None):
         # seed for a stable gradient descent
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
         if self.is_init:
-            # check if the graph changes
-            if not (torch.all(torch.eq(edge_index, self.edge_index)) and
-                    torch.all(torch.eq(edge_attr, self.edge_attr))):
+            try:
+                # check if the graph changes
+                if (not torch.all(torch.eq(edge_index, self.edge_index))) or \
+                        (edge_attr is not None and torch.all(torch.eq(edge_attr, self.edge_attr))):
+                    self.is_init = False
+            except:
                 self.is_init = False
 
         if not self.is_init:
             if self.save_full_init:
-                self._init_bp_with_save(edge_index, edge_attr)
+                self._init_bp_with_save(edge_index, num_nodes, edge_attr)
             else:
-                self._init_bp(edge_index, edge_attr)
+                self._init_bp(edge_index, num_nodes, edge_attr)
             self.is_init = True
 
         # messages need to be initialized every single run with the same random value (for gradients)
@@ -207,21 +211,21 @@ class BeliefPropagation(nn.Module):
                          .format(is_converged, num_iter, max_diff))
         if self.writer is not None:
             self.writer.add_scalar("beta", self.beta.item(), self.global_step)
-            if self.global_step > 0:  # at step 0, gradient is not computed
+            if self.beta.grad is not None:  # at step 0, gradient is not computed
                 self.writer.add_scalar("beta_grad", self.beta.grad.item(), self.global_step)
             self.writer.add_scalar("num_iter", num_iter, self.global_step)
             self.writer.add_scalar("max_diff", max_diff, self.global_step)
             if self.bp_implementation_type == 'parallel':
                 for i in range(self.num_groups):
-                    self.writer.add_histogram("message_dim{}".format(i), self.message_map[:, i].flatten(),
+                    self.writer.add_histogram("bp_hist/message_dim{}".format(i), self.message_map[:, i].flatten(),
                                               self.global_step)
-                    self.writer.add_histogram("psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
+                    self.writer.add_histogram("bp_hist/psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
                                               self.global_step)
             self.global_step += 1
         if not is_converged:
-            self.logger.warning("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
+            self.logger.info("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
                                 .format(num_iter, self.beta.data, max_diff))
-            self.logger.warning("parallel_max_node_percent={0:.2f}, in case of parallelization, "
+            self.logger.info("parallel_max_node_percent={0:.2f}, in case of parallelization, "
                                 "reducing this percentage is good for BP to converge"
                                 .format(self.parallel_max_node_percent))
         if (self.beta < 0.05).sum() > 0:
@@ -342,14 +346,14 @@ class BeliefPropagation(nn.Module):
     """ ----------------------------------------------------------- """
 
     @use_logging(level='info')
-    def _init_bp_with_save(self, edge_index, edge_attr):
+    def _init_bp_with_save(self, edge_index, num_nodes, edge_attr=None):
         try:
             self._load_bp_init()
             self.logger.info("Succeed to load BP Job from file, skipping init...")
         except Exception as e:
             self.logger.info(e)
             self.logger.info("Failed to load BP Job from file, running init...")
-            self._init_bp(edge_index, edge_attr)
+            self._init_bp(edge_index, num_nodes, edge_attr)
             try:
                 self._save_bp_init()
                 self.logger.info("Saved BP Job to {}".format(self.save_init_path))
@@ -358,14 +362,15 @@ class BeliefPropagation(nn.Module):
                 self.logger.info("Failed to save BP Job to file")
 
     @use_logging(level='info')
-    def _init_bp(self, edge_index, edge_attr):
-        self._init_graph(edge_index, edge_attr)
+    def _init_bp(self, edge_index, num_nodes, edge_attr=None):
+        self._init_graph(edge_index, num_nodes, edge_attr)
         if self.bp_init_type == 'new':
             self._init_message_indexes_new()
         if self.bp_init_type == 'old':
             self._init_message_indexes_old()
         if not self.is_beta_init:
             self._init_beta()
+            self.is_beta_init = True
         if self.bp_implementation_type == 'legacy':
             self._init_lock_legacy()
         elif self.bp_implementation_type == 'parallel':
@@ -386,8 +391,8 @@ class BeliefPropagation(nn.Module):
             torch.save(self, ouf)
 
     @use_logging(level='info')
-    def _init_graph(self, edge_index, edge_attr):
-        self.adjacency_matrix = edge_index_to_csr(edge_index, edge_attr)
+    def _init_graph(self, edge_index, num_nodes, edge_attr=None):
+        self.adjacency_matrix = edge_index_to_csr(edge_index, num_nodes, edge_attr)
         if edge_attr is not None:
             rand_int = np.random.randint(edge_index.shape[1])
             assert edge_attr.shape[1] == 1
@@ -414,6 +419,8 @@ class BeliefPropagation(nn.Module):
         self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
                                           if self.parallel_max_node_percent is None else
                                           self.parallel_max_node_percent)
+        self.edge_index = edge_index
+        self.edge_attr = edge_attr
 
     @use_logging(level='info')
     def _init_message_indexes_new(self):
@@ -568,6 +575,7 @@ class BeliefPropagation(nn.Module):
 
     @use_logging(level='info')
     def __init_node_update_slice_dict_mp_save(self):
+        # TODO: dok_map (30GB in memory) blows up the RAM
         all_nodes = list(range(self.num_nodes))
         todo_list = self.__load_node_dict_(all_nodes)
         if len(todo_list) > 0:
@@ -612,10 +620,8 @@ class BeliefPropagation(nn.Module):
             self.logger.info("nodes failed to load from file: {}".format(len(failed_nodes)))
         return failed_nodes
 
-
-def __repr__(self):
-    return '{0}(num_groups={1}, max_num_iter={2}, bp_max_diff={3}, bp_dumping_rate={4})'.format(
-        self.__class__.__name__, self.num_groups, self.max_num_iter, self.bp_max_diff, self.bp_dumping_rate)
+    def __repr__(self):
+        return '{}(num_groups={})'.format(self.__class__.__name__, self.num_groups)
 
 
 if __name__ == '__main__':
@@ -638,19 +644,19 @@ if __name__ == '__main__':
     percent = 1 / np.sqrt(c + 1)
     print(percent)
 
-    reddit = Reddit('datasets/Reddit')
-    num_groups = int(reddit.data.y.max() - reddit.data.y.min())
-    edge_index = reddit.data.edge_index
-    ground_truth = reddit.data.y
+    # reddit = Reddit('datasets/Reddit')
+    # num_groups = int(reddit.data.y.max() - reddit.data.y.min())
+    # edge_index = reddit.data.edge_index
+    # ground_truth = reddit.data.y
 
     bp = BeliefPropagation(num_groups, mean_degree=None, verbose_iter=True,
                            max_num_iter=100, verbose_init=True,
                            parallel_max_node_percent=0.1,
-                           bp_max_diff=1e-2, disable_gradient=True,
-                           bp_init_type='new', save_node_dict=True,
+                           bp_max_diff=1e-2, disable_gradient=False,
+                           bp_init_type='new', save_node_dict=False,
                            save_full_init=False,
                            mp_chunksize=1, mp_processes_count=4,
-                           dataset_unique_name='reddit', node_job_slice=slice(1, 50000, 1))
+                           dataset_unique_name='sbm', node_job_slice=None)
     # bp.beta.data = torch.tensor(1.75)
     entropy = EntropyLoss()
     bp = bp.cuda()
