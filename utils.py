@@ -160,6 +160,8 @@ def edge_index_to_csr(edge_index, num_nodes, edge_attr=None):
     :param edge_attr: Tensor
     :return:
     """
+    if edge_index.min() < 0:
+        edge_index -= edge_index.min()
     shape = (num_nodes, num_nodes)
     if edge_attr is not None:
         assert edge_attr.shape[1] == 1
@@ -187,6 +189,21 @@ def adj_to_edge_index(adj):
     edge_attr = torch.tensor(A.data).unsqueeze(-1)
 
     return edge_index, edge_attr
+
+
+def pad_with_zero(max_x_size, data):
+    """
+    pad to same size for a batch run
+    :param data:
+    :param max_x_size:
+    :return:
+    """
+    x = data.x
+    data.num_nodes = max_x_size
+    padded_x = torch.zeros(max_x_size, x.shape[1])
+    padded_x[:x.shape[0], :] = x
+    data.x = padded_x
+    return data
 
 
 def count_memory(tensors):

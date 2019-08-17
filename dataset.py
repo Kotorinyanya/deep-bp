@@ -1,5 +1,6 @@
 from torch_geometric.data import InMemoryDataset
 from tqdm import tqdm
+import random
 
 from utils import *
 
@@ -8,11 +9,13 @@ class BAvsER(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None,
                  seed=0):
         self.seed = seed
-        self.num_ba = 2500
-        self.num_er = 2500
+        self.num_ba = 500
+        self.num_er = 500
         self.N = 50
-        self.ba_ms = [1, int(self.N / 8), int(2 * self.N / 8), int(3 * self.N / 8), int(4 * self.N / 8)]
-        self.er_ps = [1 / self.N, 1 / 8, 2 / 8, 3 / 8, 4 / 8]
+        # self.ba_ms = [1, int(self.N / 8), int(2 * self.N / 8), int(3 * self.N / 8), int(4 * self.N / 8)]
+        # self.er_ps = [1 / self.N, 1 / 8, 2 / 8, 3 / 8, 4 / 8]
+        self.ba_ms = [int(self.N / 8)]
+        self.er_ps = [1 / 8]
 
         super(BAvsER, self).__init__(root, transform, pre_transform)
         self.data, self.slices = torch.load(self.processed_paths[0])
@@ -30,6 +33,9 @@ class BAvsER(InMemoryDataset):
 
     def process(self):
         data_list = self._generate_ba() + self._generate_er()
+        random.seed(self.seed)
+        random.shuffle(data_list)
+
         self.data, self.slices = self.collate(data_list)
         torch.save((self.data, self.slices), self.processed_paths[0])
 
@@ -64,7 +70,7 @@ class BAvsER(InMemoryDataset):
         adj = nx.to_numpy_array(G)
         edge_index, _ = adj_to_edge_index(adj)
         x = torch.ones(G.number_of_nodes(), 1)
-        y = torch.tensor([label], dtype=torch.float)
+        y = torch.tensor([label], dtype=torch.long)
         return Data(x=x, edge_index=edge_index, y=y)
 
 
