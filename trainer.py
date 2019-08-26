@@ -18,7 +18,7 @@ import time
 import numpy as np
 
 from dataset import BAvsER
-from models.BAVSER import Net
+from models.ENZYMES import Net
 from models.ENZYMES import SAGE_DIFFPOOL
 
 
@@ -278,10 +278,10 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
 
 if __name__ == "__main__":
     # dataset = TUDataset(root='datasets/ENZYMES', name='ENZYMES')
-    trans = partial(pad_with_zero, 130)
+    trans = partial(pad_with_zero, 126)
     dataset = TUDataset(root='datasets/ENZYMES', name='ENZYMES',
                         transform=trans)
-    model = SAGE_DIFFPOOL
-    train_cross_validation(model, dataset, comment='diffpool', batch_size=20,
+    model = Net
+    train_cross_validation(model, dataset, comment='bp_enzymes', batch_size=20,
                            num_epochs=500, dropout=0.1, lr=1e-2, weight_decay=0,
                            use_gpu=False, dp=False, ddp=False, device_ids=[4, 5, 6, 7])
