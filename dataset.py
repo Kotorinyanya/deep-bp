@@ -9,8 +9,8 @@ class BAvsER(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None,
                  seed=0):
         self.seed = seed
-        self.num_ba = 500
-        self.num_er = 500
+        self.num_ba = 2500
+        self.num_er = 2500
         self.N = 50
         # self.ba_ms = [1, int(self.N / 8), int(2 * self.N / 8), int(3 * self.N / 8), int(4 * self.N / 8)]
         # self.er_ps = [1 / self.N, 1 / 8, 2 / 8, 3 / 8, 4 / 8]
