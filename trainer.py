@@ -31,7 +31,7 @@ def to_cuda(data_list, device):
 
 
 def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
-                           weight_decay=1e-2, num_epochs=200, n_splits=5,
+                           weight_decay=1e-2, num_epochs=200, n_splits=10,
                            use_gpu=True, dp=False, ddp=False,
                            comment='', tb_service_loc='192.168.192.57:6006', batch_size=1,
                            num_workers=0, pin_memory=False, cuda_device=None,

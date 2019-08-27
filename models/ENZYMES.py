@@ -1,4 +1,5 @@
 import torch.nn.functional as F
+from boxx import timeit
 from torch_geometric.nn import SAGEConv
 from nn.conv import GCNConv
 import torch_geometric
@@ -19,6 +20,8 @@ class Net(nn.Module):
         self.bp = BeliefPropagation(num_groups,
                                     mean_degree=3.8,
                                     summary_writer=writer,
+                                    max_num_iter=10,
+                                    bp_max_diff=1e-1,
                                     verbose_init=False)
         self.entropy = EntropyLoss()
         self.drop1 = nn.Dropout(dropout)
@@ -38,7 +41,6 @@ class Net(nn.Module):
 
         _, s, _ = self.bp(edge_index, x.shape[0])
         ent_loss = self.entropy(s)
-
         x = x.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1)
         s = s.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1)
 
