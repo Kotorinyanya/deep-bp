@@ -34,7 +34,7 @@ class BeliefPropagation(nn.Module):
                  max_num_iter=10,
                  bp_max_diff=5e-1,
                  bp_dumping_rate=1.0,
-                 save_init_path='saved/',
+                 save_init_path='.cache/',
                  dataset_unique_name='',
                  is_logging=True,
                  verbose_iter=False,
@@ -84,16 +84,14 @@ class BeliefPropagation(nn.Module):
         assert bp_type in ['exact', 'approximate']
         assert bp_implementation_type in ['parallel', 'legacy']
         assert bp_init_type in ['old', 'new']
-        if save_node_dict or save_full_init:
-            assert len(dataset_unique_name) > 0
         if bp_implementation_type == 'parallel':
             global scatter_mul
             from torch_scatter import scatter_mul
 
+        self.dataset_uuid = dataset_unique_name if dataset_unique_name != '' else None
         self.save_full_init = save_full_init
         self.save_node_dict = save_node_dict
         self.multi_processing = multi_processing
-        self.dataset_unique_name = dataset_unique_name
         self.save_init_path = save_init_path
         self.mp_processes_count = mp_processes_count if mp_processes_count is not None else os.cpu_count()
         self.mp_chunksize = mp_chunksize
@@ -144,14 +142,43 @@ class BeliefPropagation(nn.Module):
         self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
         # initialized later on calling forward
-        self.G, self.adjacency_matrix = None, None
-        self.mean_w, self.num_nodes, self.mean_degree, self.is_weighted = None, None, None, None
-        self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
-        self.node_id_to_index, self.num_messages, self.message_index_set, self.dok_map = None, None, None, None
-        self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
-        self.dok_map, self.csc_map = None, None
-        self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
-        self._saved_message_update_dict, self._saved_psi_update_dict = None, None
+        # self.G, self.adjacency_matrix = None, None
+        # self.mean_w, self.num_nodes, self.mean_degree, self.is_weighted = None, None, None, None
+        # self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
+        # self.node_id_to_index, self.num_messages, self.message_index_set, self.dok_map = None, None, None, None
+        # self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
+        # self.dok_map, self.csc_map = None, None
+        # self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
+        # self._saved_message_update_dict, self._saved_psi_update_dict = None, None
+        self.job_attrs = [
+            'G',
+            'adjacency_matrix',
+            'mean_w',
+            'num_nodes',
+            'mean_degree',
+            'is_weighted',
+            'marginal_psi',
+            'message_map',
+            'h',
+            'w_indexed',
+            'message_index_list',
+            'node_id_to_index',
+            'num_messages',
+            'message_index_set',
+            'dok_map',
+            '_lock_psi',
+            '_lock_mmap',
+            '_lock_h',
+            'csc_map',
+            'job_list',
+            '_update_message_slice_and_index',
+            '_update_psi_slice_and_index',
+            '_saved_message_update_dict',
+            '_saved_psi_update_dict'
+        ]
+        for name in self.job_attrs:
+            setattr(self, name, None)
+
         self.is_init, self.global_step = False, 0
         self.edge_index, self.edge_attr = None, None
 
@@ -179,6 +206,10 @@ class BeliefPropagation(nn.Module):
         return self.message_map, self.marginal_psi, self.csc_map
 
     def init_bp(self, edge_index, num_nodes, edge_attr=None):
+        # uuid for saving init
+        if self.dataset_uuid is None:
+            self.dataset_uuid = my_uuid(str(locals()))
+
         # seed for a stable gradient descent
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
@@ -224,10 +255,10 @@ class BeliefPropagation(nn.Module):
             self.global_step += 1
         if not is_converged:
             self.logger.info("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
-                                .format(num_iter, self.beta.data, max_diff))
+                             .format(num_iter, self.beta.data, max_diff))
             self.logger.info("parallel_max_node_percent={0:.2f}, in case of parallelization, "
-                                "reducing this percentage is good for BP to converge"
-                                .format(self.parallel_max_node_percent))
+                             "reducing this percentage is good for BP to converge"
+                             .format(self.parallel_max_node_percent))
         if (self.beta < 0.05).sum() > 0:
             self.logger.critical("P:beta={0}, indicating paramagnetic phase in BP, "
                                  "please consider adding the weight for entropy_loss".format(self.beta.data))
@@ -350,6 +381,9 @@ class BeliefPropagation(nn.Module):
         try:
             self._load_bp_init()
             self.logger.info("Succeed to load BP Job from file, skipping init...")
+            if not self.is_beta_init:
+                self._init_beta()
+                self.is_beta_init = True
         except Exception as e:
             self.logger.info(e)
             self.logger.info("Failed to load BP Job from file, running init...")
@@ -381,13 +415,21 @@ class BeliefPropagation(nn.Module):
 
     @use_logging(level='info')
     def _load_bp_init(self):
-        with open(osp.join(self.save_init_path, self.dataset_unique_name), 'rb') as inf:
+        path = osp.join(self.save_init_path, self.dataset_uuid)
+        with open(path, 'rb') as inf:
+            self.logger.info("loading init {}".format(path))
             saved_obj = torch.load(inf)
-            self.__dict__.update(saved_obj.__dict__)
+            load_dict = saved_obj.__dict__
+            for k in self.job_attrs:
+                self.__dict__[k] = load_dict[k]
 
     @use_logging(level='info')
     def _save_bp_init(self):
-        with open(osp.join(self.save_init_path, self.dataset_unique_name), 'wb') as ouf:
+        try:
+            os.mkdir(self.save_init_path)
+        except:
+            pass
+        with open(osp.join(self.save_init_path, self.dataset_uuid), 'wb') as ouf:
             torch.save(self, ouf)
 
     @use_logging(level='info')
@@ -517,7 +559,7 @@ class BeliefPropagation(nn.Module):
         all_nodes = all_nodes[self.node_job_slice] if self.node_job_slice is not None else all_nodes
         todo_list = self.__load_node_dict_(all_nodes)
         if len(todo_list) > 0:
-            parent_path = osp.join(self.save_init_path, self.dataset_unique_name)
+            parent_path = osp.join(self.save_init_path, self.dataset_uuid)
             for dst_node in (tqdm(todo_list) if self.verbose_init else todo_list):
                 save_path = parent_path + '-node-{0}'.format(dst_node)
                 _save_node_dict(self.csc_map, self.dok_map, self.num_messages, self.beta.device, dst_node, save_path)
@@ -585,7 +627,7 @@ class BeliefPropagation(nn.Module):
             workers = [ctx.Process(
                 target=save_node_list_dict,
                 args=(self.csc_map, self.dok_map, self.num_messages, self.beta.device, node_list,
-                      osp.join(self.save_init_path, self.dataset_unique_name))
+                      osp.join(self.save_init_path, self.dataset_uuid))
             ) for node_list in chucks]
             for w in workers:
                 w.start()
@@ -602,7 +644,7 @@ class BeliefPropagation(nn.Module):
         with tqdm(desc="load node dict", total=len(todo_list), disable=(not self.verbose_init)) as pbar:
             for node in todo_list:
                 try:
-                    saved_path = osp.join(self.save_init_path, self.dataset_unique_name) + '-node-{0}'.format(node)
+                    saved_path = osp.join(self.save_init_path, self.dataset_uuid) + '-node-{0}'.format(node)
                     # TODO: check but not load
                     d = torch.load(saved_path)
                     if self.beta.device == 'cpu':
@@ -654,12 +696,12 @@ if __name__ == '__main__':
                            parallel_max_node_percent=0.1,
                            bp_max_diff=1e-2, disable_gradient=False,
                            bp_init_type='new', save_node_dict=False,
-                           save_full_init=False,
+                           save_full_init=True,
                            mp_chunksize=1, mp_processes_count=4,
-                           dataset_unique_name='sbm', node_job_slice=None)
+                           node_job_slice=None)
     # bp.beta.data = torch.tensor(1.75)
     entropy = EntropyLoss()
     bp = bp.cuda()
-    message_map, marginal_psi, message_index_list = bp(edge_index)
+    message_map, marginal_psi, message_index_list = bp(edge_index, G.number_of_nodes())
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)

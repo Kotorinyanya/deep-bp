@@ -1,4 +1,5 @@
 from functools import reduce
+import hashlib
 
 import torch
 import logging
@@ -9,6 +10,10 @@ import networkx as nx
 from torch_geometric.data import Data
 import os.path as osp
 from scipy.sparse import coo_matrix, csr_matrix
+
+
+def my_uuid(string):
+    return hashlib.sha256(str(string).encode('utf-8')).hexdigest()
 
 
 def use_logging(level='info'):
