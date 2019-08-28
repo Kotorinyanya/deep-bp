@@ -37,6 +37,7 @@ class BeliefPropagation(nn.Module):
                  save_init_path='.cache/',
                  dataset_unique_name='',
                  is_logging=True,
+                 is_writing_hist=False,
                  verbose_iter=False,
                  verbose_init=True,
                  bp_type='approximate',
@@ -48,7 +49,8 @@ class BeliefPropagation(nn.Module):
                  multi_processing=False,
                  save_node_dict=False,
                  node_job_slice=None,
-                 save_full_init=True,
+                 save_full_init=False,
+                 batch_run=False,
                  num_workers=1,
                  mp_chunksize=2,
                  mp_processes_count=4,
@@ -78,6 +80,8 @@ class BeliefPropagation(nn.Module):
 
         super(BeliefPropagation, self).__init__()
 
+        self.is_writing_hist = is_writing_hist  # tb
+        self.batch_run = batch_run
         self.node_job_slice = node_job_slice
         if disable_gradient and bp_implementation_type == 'legacy':
             raise NotImplementedError()
@@ -143,15 +147,6 @@ class BeliefPropagation(nn.Module):
         # self.logger.info('\t mean_degree \t {0:.2f} \t beta \t {1} \t '.format(mean_degree, self.beta.data.item()))
         self.logger.warning('beta initialized to {0}'.format(self.beta.data))
 
-        # initialized later on calling forward
-        # self.G, self.adjacency_matrix = None, None
-        # self.mean_w, self.num_nodes, self.mean_degree, self.is_weighted = None, None, None, None
-        # self.marginal_psi, self.message_map, self.h, self.w_indexed, self.message_index_list = None, None, None, None, None
-        # self.node_id_to_index, self.num_messages, self.message_index_set, self.dok_map = None, None, None, None
-        # self._lock_psi, self._lock_mmap, self._lock_h = None, None, None
-        # self.dok_map, self.csc_map = None, None
-        # self.job_list, self._update_message_slice_and_index, self._update_psi_slice_and_index = None, None, None
-        # self._saved_message_update_dict, self._saved_psi_update_dict = None, None
         self.job_attrs = [
             'G',
             'adjacency_matrix',
@@ -184,14 +179,15 @@ class BeliefPropagation(nn.Module):
         self.is_init, self.global_step = False, 0
         self.edge_index, self.edge_attr = None, None
 
-    def forward(self, edge_index, num_nodes, edge_attr=None):
+    def forward(self, edge_index, num_nodes, edge_attr=None, slices=None):
         """
 
         :param edge_index:
         :param edge_attr:
+        :param slices: for batch run `TO BE IMPLEMENTED`
         :return:
         """
-        self.init_bp(edge_index, num_nodes, edge_attr)
+        self.init_bp(edge_index, num_nodes, edge_attr, slices)
 
         if self.bp_implementation_type == 'parallel':
             num_iter, max_diff = self.bp_infer_parallel()
@@ -207,9 +203,10 @@ class BeliefPropagation(nn.Module):
 
         return self.message_map, self.marginal_psi, self.csc_map
 
-    def init_bp(self, edge_index, num_nodes, edge_attr=None):
+    def init_bp(self, edge_index, num_nodes, edge_attr=None, slices=None):
         # uuid for saving init
-        self.dataset_uuid = my_uuid(str(locals()))
+        d = locals()
+        self.dataset_uuid = my_uuid(str(dict((k, d[k]) for k in ('edge_index', 'num_nodes', 'edge_attr'))))
 
         # seed for a stable gradient descent
         torch.manual_seed(self.seed)
@@ -226,9 +223,9 @@ class BeliefPropagation(nn.Module):
 
         if not self.is_init:
             if self.save_full_init:
-                self._init_bp_with_save(edge_index, num_nodes, edge_attr)
+                self._init_bp_with_save(edge_index, num_nodes, edge_attr, slices)
             else:
-                self._init_bp(edge_index, num_nodes, edge_attr)
+                self._init_bp(edge_index, num_nodes, edge_attr, slices)
             self.is_init = True
 
         # messages need to be initialized every single run with the same random value (for gradients)
@@ -247,7 +244,7 @@ class BeliefPropagation(nn.Module):
                 self.writer.add_scalar("beta_grad", self.beta.grad.item(), self.global_step)
             self.writer.add_scalar("num_iter", num_iter, self.global_step)
             self.writer.add_scalar("max_diff", max_diff, self.global_step)
-            if self.bp_implementation_type == 'parallel':
+            if self.bp_implementation_type == 'parallel' and self.is_writing_hist:
                 for i in range(self.num_groups):
                     self.writer.add_histogram("bp_hist/message_dim{}".format(i), self.message_map[:, i].flatten(),
                                               self.global_step)
@@ -378,9 +375,9 @@ class BeliefPropagation(nn.Module):
     """ ----------------------------------------------------------- """
 
     @use_logging(level='info')
-    def _init_bp_with_save(self, edge_index, num_nodes, edge_attr=None):
+    def _init_bp_with_save(self, edge_index, num_nodes, edge_attr=None, slices=None):
         try:
-            self._load_bp_init()
+            self._load_full_bp_init()
             self.logger.info("Succeed to load BP Job from file, skipping init...")
             if not self.is_beta_init:
                 self._init_beta()
@@ -388,34 +385,75 @@ class BeliefPropagation(nn.Module):
         except Exception as e:
             self.logger.info(e)
             self.logger.info("Failed to load BP Job from file, running init...")
-            self._init_bp(edge_index, num_nodes, edge_attr)
+            self._init_bp(edge_index, num_nodes, edge_attr, slices)
             try:
-                self._save_bp_init()
+                self._save_full_bp_init()
                 self.logger.info("Saved BP Job to {}".format(self.save_init_path))
             except Exception as e:
                 self.logger.info(e)
                 self.logger.info("Failed to save BP Job to file")
 
     @use_logging(level='info')
-    def _init_bp(self, edge_index, num_nodes, edge_attr=None):
-        self._init_graph(edge_index, num_nodes, edge_attr)
-        if self.bp_init_type == 'new':
-            self._init_message_indexes_new()
-        if self.bp_init_type == 'old':
-            self._init_message_indexes_old()
-        if not self.is_beta_init:
-            self._init_beta()
-            self.is_beta_init = True
-        if self.bp_implementation_type == 'legacy':
-            self._init_lock_legacy()
-        elif self.bp_implementation_type == 'parallel':
-            if self.bp_init_type == 'old':
-                self._init_job_list_old()
-            if self.bp_init_type == 'new':
-                self._init_job_list_new()
+    def _init_bp(self, edge_index, num_nodes, edge_attr=None, slices=None):
+        if self.batch_run and self.bp_implementation_type == 'parallel' and self.bp_init_type == 'new':
+            self._init_bp_batch_run(edge_index, slices, edge_attr)
+        else:
+            self._init_graph(edge_index, num_nodes, edge_attr)
+            if not self.is_beta_init:
+                self._init_beta()
+                self.is_beta_init = True
+            if self.bp_implementation_type == 'legacy':
+                self._init_lock_legacy()
+            elif self.bp_implementation_type == 'parallel':
+                if self.bp_init_type == 'old':
+                    self._init_message_indexes_old()
+                    self._init_job_list_old()
+                if self.bp_init_type == 'new':
+                    self._init_message_indexes_new()
+                    self._init_job_list_new()
 
     @use_logging(level='info')
-    def _load_bp_init(self):
+    def _init_bp_batch_run(self, edge_index, slices, edge_attr=None):
+        raise NotImplementedError("TODO")
+        batch_job_list, batch_saved_message_update_dict, batch_saved_psi_update_dict = [], [], []
+        for i in range(10):
+            self._init_graph(edge_index, edge_attr)
+            self._init_message_indexes_new()
+            _job_list = create_job_list_parallel_fast(
+                self.csc_map, self.parallel_max_node_percent * self.num_nodes, self.seed, self.verbose_init)
+            iter_items = enumerate(node_list_to_slice_and_index_message(
+                range(self.num_nodes), self.csc_map, self.dok_map, self.num_messages,
+                self.beta.device
+            ))
+            _saved_message_update_dict = {
+                n: (w, r, i)
+                for n, (w, r, i) in (
+                    tqdm(iter_items, desc="message update dict", total=self.num_nodes)
+                    if self.verbose_init else
+                    iter_items
+                )
+            }
+            iter_items = enumerate(node_list_to_slice_and_index_psi(
+                range(self.num_nodes), self.csc_map, self.num_messages,
+                self.beta.device
+            ))
+            _saved_psi_update_dict = {
+                n: (w, r, i)
+                for n, (w, r, i) in (
+                    tqdm(iter_items, desc="psi update dict", total=self.num_nodes)
+                    if self.verbose_init else
+                    iter_items
+                )
+            }
+            batch_job_list.append(_job_list)
+            batch_saved_message_update_dict.append(_saved_message_update_dict)
+            batch_saved_psi_update_dict.append(_saved_psi_update_dict)
+
+        self._init_graph(edge_index, edge_attr)
+        self._init_message_indexes_new()
+
+    @use_logging(level='info')
+    def _load_full_bp_init(self):
         path = osp.join(self.save_init_path, self.dataset_uuid)
         with open(path, 'rb') as inf:
             self.logger.info("loading init {}".format(path))
@@ -424,7 +462,7 @@ class BeliefPropagation(nn.Module):
                 self.__dict__[k] = load_dict[k]
 
     @use_logging(level='info')
-    def _save_bp_init(self):
+    def _save_full_bp_init(self):
         # try:
         #     os.mkdir(self.save_init_path)
         # except Exception as e:
@@ -456,8 +494,9 @@ class BeliefPropagation(nn.Module):
         if self.bp_implementation_type == 'legacy':  # deprecated
             self.logger.warning("legacy is deprecated")
             self.G = nx.to_networkx_graph(self.adjacency_matrix)
-        self.num_nodes = self.adjacency_matrix.shape[0]
-        self.mean_w = self.adjacency_matrix.mean()
+        self.num_nodes = num_nodes
+        self.mean_w = self.adjacency_matrix.sum() / np.sum(self.adjacency_matrix.sum(axis=1) > 0) ** 2
+        # self.mean_w = self.adjacency_matrix.mean()
         self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
         self.parallel_max_node_percent = (1 / torch.sqrt(self.mean_degree + 1)
                                           if self.parallel_max_node_percent is None else
@@ -494,6 +533,8 @@ class BeliefPropagation(nn.Module):
         # initialize message
         if self.bp_implementation_type == 'parallel':
             self.message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
+            self.message_map.data = nn.init.xavier_uniform_(
+                self.message_map.data, gain=nn.init.calculate_gain('relu'))
             self.message_map = self.message_map / self.message_map.sum(1).reshape(-1, 1)
         elif self.bp_implementation_type == 'legacy':
             self.message_map = init_messages_legacy(self)
@@ -699,10 +740,11 @@ if __name__ == '__main__':
                            bp_init_type='new', save_node_dict=False,
                            save_full_init=True,
                            mp_chunksize=1, mp_processes_count=4,
-                           node_job_slice=None)
+                           node_job_slice=None,
+                           batch_run=False)
     # bp.beta.data = torch.tensor(1.75)
     entropy = EntropyLoss()
     bp = bp.cuda()
-    message_map, marginal_psi, message_index_list = bp(edge_index, G.number_of_nodes())
+    message_map, marginal_psi, message_index_list = bp(edge_index)
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)

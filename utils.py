@@ -15,7 +15,6 @@ from scipy.sparse import coo_matrix, csr_matrix
 def my_uuid(string):
     return hashlib.sha256(str(string).encode('utf-8')).hexdigest()
 
-
 def use_logging(level='info'):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -161,10 +160,10 @@ def edge_index_to_csr(edge_index, num_nodes, edge_attr=None):
     """
     coo_matrix(coordinate matrix) is fast to get row
     :param edge_index: Tensor
-    :param num_nodes: int
     :param edge_attr: Tensor
     :return:
     """
+    # num_nodes = int(edge_index.max()) + 1
     if edge_index.min() < 0:
         edge_index -= edge_index.min()
     shape = (num_nodes, num_nodes)
