@@ -56,7 +56,7 @@ class SAGEConv(MessagePassing):
 
     def reset_parameters(self):
         # uniform(self.in_channels, self.weight)
-        self.weight.data = nn.init.xavier_uniform(self.weight.data, gain=nn.init.calculate_gain('relu'))
+        self.weight.data = nn.init.xavier_uniform_(self.weight.data, gain=nn.init.calculate_gain('relu'))
         uniform(self.in_channels, self.bias)
 
     def forward(self, x, edge_index, size=None):
@@ -117,7 +117,7 @@ class GCNConv(MessagePassing):
     def __init__(self,
                  in_channels,
                  out_channels,
-                 type=1,
+                 type=3,
                  improved=False,
                  cached=False,
                  bias=True,
@@ -141,8 +141,8 @@ class GCNConv(MessagePassing):
         self.reset_parameters()
 
     def reset_parameters(self):
-        glorot(self.weight)
-        # self.weight.data = nn.init.xavier_uniform(self.weight.data, gain=nn.init.calculate_gain('relu'))
+        # glorot(self.weight)
+        self.weight.data = nn.init.xavier_uniform_(self.weight.data, gain=nn.init.calculate_gain('relu'))
         zeros(self.bias)
         self.cached_result = None
         self.cached_num_edges = None
@@ -201,8 +201,8 @@ class GCNConv(MessagePassing):
         return aggr_out
 
     def __repr__(self):
-        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
-                                   self.out_channels)
+        return '{}({}, {}, type={})'.format(self.__class__.__name__, self.in_channels,
+                                   self.out_channels, self.type)
 
 
 class EGATConv(torch.nn.Module):
