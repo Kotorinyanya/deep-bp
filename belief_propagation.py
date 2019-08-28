@@ -48,7 +48,7 @@ class BeliefPropagation(nn.Module):
                  multi_processing=False,
                  save_node_dict=False,
                  node_job_slice=None,
-                 save_full_init=False,
+                 save_full_init=True,
                  num_workers=1,
                  mp_chunksize=2,
                  mp_processes_count=4,
@@ -88,7 +88,9 @@ class BeliefPropagation(nn.Module):
             global scatter_mul
             from torch_scatter import scatter_mul
 
-        self.dataset_uuid = dataset_unique_name if dataset_unique_name != '' else None
+        self.dataset_unique_name = dataset_unique_name if dataset_unique_name != '' else None
+        # TODO: change for dataset_unique_name
+        self.dataset_uuid = None
         self.save_full_init = save_full_init
         self.save_node_dict = save_node_dict
         self.multi_processing = multi_processing
@@ -207,8 +209,7 @@ class BeliefPropagation(nn.Module):
 
     def init_bp(self, edge_index, num_nodes, edge_attr=None):
         # uuid for saving init
-        if self.dataset_uuid is None:
-            self.dataset_uuid = my_uuid(str(locals()))
+        self.dataset_uuid = my_uuid(str(locals()))
 
         # seed for a stable gradient descent
         torch.manual_seed(self.seed)
@@ -418,19 +419,19 @@ class BeliefPropagation(nn.Module):
         path = osp.join(self.save_init_path, self.dataset_uuid)
         with open(path, 'rb') as inf:
             self.logger.info("loading init {}".format(path))
-            saved_obj = torch.load(inf)
-            load_dict = saved_obj.__dict__
+            load_dict = torch.load(inf)
             for k in self.job_attrs:
                 self.__dict__[k] = load_dict[k]
 
     @use_logging(level='info')
     def _save_bp_init(self):
-        try:
-            os.mkdir(self.save_init_path)
-        except:
-            pass
+        # try:
+        #     os.mkdir(self.save_init_path)
+        # except Exception as e:
+        #     print(e)
         with open(osp.join(self.save_init_path, self.dataset_uuid), 'wb') as ouf:
-            torch.save(self, ouf)
+            save_dict = {k: v for k, v in self.__dict__.items() if k in self.job_attrs}
+            torch.save(save_dict, ouf)
 
     @use_logging(level='info')
     def _init_graph(self, edge_index, num_nodes, edge_attr=None):
