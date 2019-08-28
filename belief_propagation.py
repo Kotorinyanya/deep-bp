@@ -80,7 +80,7 @@ class BeliefPropagation(nn.Module):
 
         super(BeliefPropagation, self).__init__()
 
-        self.is_writing_hist = is_writing_hist  # tb
+        self.is_writing_hist = is_writing_hist # tb
         self.batch_run = batch_run
         self.node_job_slice = node_job_slice
         if disable_gradient and bp_implementation_type == 'legacy':
@@ -533,8 +533,6 @@ class BeliefPropagation(nn.Module):
         # initialize message
         if self.bp_implementation_type == 'parallel':
             self.message_map = torch.rand(self.num_messages, self.num_groups, device=self.beta.device)
-            self.message_map.data = nn.init.xavier_uniform_(
-                self.message_map.data, gain=nn.init.calculate_gain('relu'))
             self.message_map = self.message_map / self.message_map.sum(1).reshape(-1, 1)
         elif self.bp_implementation_type == 'legacy':
             self.message_map = init_messages_legacy(self)
