@@ -11,6 +11,8 @@ import networkx as nx
 import numpy as np
 import torch
 from torch import nn
+from torch_geometric.data import Batch
+from torch_geometric.utils import to_scipy_sparse_matrix
 from tqdm import tqdm
 from torch_geometric.datasets import KarateClub, Reddit
 from multiprocessing import Pool, Manager
@@ -80,7 +82,7 @@ class BeliefPropagation(nn.Module):
 
         super(BeliefPropagation, self).__init__()
 
-        self.is_writing_hist = is_writing_hist # tb
+        self.is_writing_hist = is_writing_hist  # tb
         self.batch_run = batch_run
         self.node_job_slice = node_job_slice
         if disable_gradient and bp_implementation_type == 'legacy':
@@ -396,7 +398,7 @@ class BeliefPropagation(nn.Module):
     @use_logging(level='info')
     def _init_bp(self, edge_index, num_nodes, edge_attr=None, slices=None):
         if self.batch_run and self.bp_implementation_type == 'parallel' and self.bp_init_type == 'new':
-            self._init_bp_batch_run(edge_index, slices, edge_attr)
+            self._init_bp_batch_run(edge_index, slices, num_nodes, edge_attr)
         else:
             self._init_graph(edge_index, num_nodes, edge_attr)
             if not self.is_beta_init:
@@ -413,41 +415,19 @@ class BeliefPropagation(nn.Module):
                     self._init_job_list_new()
 
     @use_logging(level='info')
-    def _init_bp_batch_run(self, edge_index, slices, edge_attr=None):
-        raise NotImplementedError("TODO")
+    def _init_bp_batch_run(self, edge_index_list, slices, num_nodes, edge_attr_list=None):
+        # raise NotImplementedError("TODO")
+        if edge_attr_list is None:
+            edge_attr_list = [None] * len(edge_index_list)
         batch_job_list, batch_saved_message_update_dict, batch_saved_psi_update_dict = [], [], []
-        for i in range(10):
-            self._init_graph(edge_index, edge_attr)
+
+        for edge_index, edge_attr in zip(edge_index_list, edge_attr_list):
+            self._init_graph(edge_index, num_nodes, edge_attr)
             self._init_message_indexes_new()
-            _job_list = create_job_list_parallel_fast(
-                self.csc_map, self.parallel_max_node_percent * self.num_nodes, self.seed, self.verbose_init)
-            iter_items = enumerate(node_list_to_slice_and_index_message(
-                range(self.num_nodes), self.csc_map, self.dok_map, self.num_messages,
-                self.beta.device
-            ))
-            _saved_message_update_dict = {
-                n: (w, r, i)
-                for n, (w, r, i) in (
-                    tqdm(iter_items, desc="message update dict", total=self.num_nodes)
-                    if self.verbose_init else
-                    iter_items
-                )
-            }
-            iter_items = enumerate(node_list_to_slice_and_index_psi(
-                range(self.num_nodes), self.csc_map, self.num_messages,
-                self.beta.device
-            ))
-            _saved_psi_update_dict = {
-                n: (w, r, i)
-                for n, (w, r, i) in (
-                    tqdm(iter_items, desc="psi update dict", total=self.num_nodes)
-                    if self.verbose_init else
-                    iter_items
-                )
-            }
-            batch_job_list.append(_job_list)
-            batch_saved_message_update_dict.append(_saved_message_update_dict)
-            batch_saved_psi_update_dict.append(_saved_psi_update_dict)
+            self._init_job_list_new()
+            batch_job_list.append(self.job_list)
+            batch_saved_message_update_dict.append(self._saved_message_update_dict)
+            batch_saved_psi_update_dict.append(self._saved_psi_update_dict)
 
         self._init_graph(edge_index, edge_attr)
         self._init_message_indexes_new()
@@ -472,7 +452,7 @@ class BeliefPropagation(nn.Module):
             torch.save(save_dict, ouf)
 
     @use_logging(level='info')
-    def _init_graph(self, edge_index, num_nodes, edge_attr=None):
+    def _init_graph(self, edge_index, num_nodes=None, edge_attr=None):
         self.adjacency_matrix = edge_index_to_csr(edge_index, num_nodes, edge_attr)
         if edge_attr is not None:
             rand_int = np.random.randint(edge_index.shape[1])
@@ -494,7 +474,7 @@ class BeliefPropagation(nn.Module):
         if self.bp_implementation_type == 'legacy':  # deprecated
             self.logger.warning("legacy is deprecated")
             self.G = nx.to_networkx_graph(self.adjacency_matrix)
-        self.num_nodes = num_nodes
+        self.num_nodes = num_nodes if num_nodes is not None else self.adjacency_matrix.shape[-1]
         self.mean_w = self.adjacency_matrix.sum() / np.sum(self.adjacency_matrix.sum(axis=1) > 0) ** 2
         # self.mean_w = self.adjacency_matrix.mean()
         self.mean_degree = torch.tensor(self.mean_w * self.num_nodes, device=self.beta.device)
@@ -709,7 +689,7 @@ class BeliefPropagation(nn.Module):
 if __name__ == '__main__':
     num_groups = 2
     sizes = np.asarray([50] * num_groups)
-    epslion = 0.3
+    epslion = 0.4
     P = np.ones((num_groups, num_groups)) * 0.1
     for i in range(len(P)):
         P[i][i] = P[i][i] / epslion
@@ -734,7 +714,7 @@ if __name__ == '__main__':
     bp = BeliefPropagation(num_groups, mean_degree=None, verbose_iter=True,
                            max_num_iter=100, verbose_init=True,
                            parallel_max_node_percent=0.1,
-                           bp_max_diff=1e-2, disable_gradient=False,
+                           bp_max_diff=4e-1, disable_gradient=False,
                            bp_init_type='new', save_node_dict=False,
                            save_full_init=True,
                            mp_chunksize=1, mp_processes_count=4,
@@ -742,7 +722,7 @@ if __name__ == '__main__':
                            batch_run=False)
     # bp.beta.data = torch.tensor(1.75)
     entropy = EntropyLoss()
-    bp = bp.cuda()
-    message_map, marginal_psi, message_index_list = bp(edge_index)
+    # bp = bp.cuda()
+    message_map, marginal_psi, message_index_list = bp(edge_index, G.number_of_nodes())
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)

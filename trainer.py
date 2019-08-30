@@ -19,7 +19,7 @@ import numpy as np
 
 from dataset import BAvsER
 from models.ENZYMES import Net
-from models.ENZYMES import SAGE_DIFFPOOL
+from models.ENZYMES import ASSEMBLY
 
 
 def to_cuda(data_list, device):
@@ -209,9 +209,9 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                     epoch_label = torch.cat([epoch_label, label.detach().cpu().float()])
                     epoch_predicted = torch.cat([epoch_predicted, predicted.detach().cpu().float()])
 
-                precision = sklearn.metrics.precision_score(epoch_label, epoch_predicted, average='micro')
-                recall = sklearn.metrics.recall_score(epoch_label, epoch_predicted, average='micro')
-                f1_score = sklearn.metrics.f1_score(epoch_label, epoch_predicted, average='micro')
+                # precision = sklearn.metrics.precision_score(epoch_label, epoch_predicted, average='micro')
+                # recall = sklearn.metrics.recall_score(epoch_label, epoch_predicted, average='micro')
+                # f1_score = sklearn.metrics.f1_score(epoch_label, epoch_predicted, average='micro')
                 accuracy = sklearn.metrics.accuracy_score(epoch_label, epoch_predicted)
                 epoch_total_loss = running_total_loss / dataloader.__len__()
                 epoch_nll_loss = running_nll_loss / dataloader.__len__()
@@ -223,14 +223,14 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                 writer.add_scalars('accuracy',
                                    {'{}_accuracy'.format(phase): accuracy},
                                    epoch)
-                writer.add_scalars('{}_APRF'.format(phase),
-                                   {
-                                       'accuracy': accuracy,
-                                       'precision': precision,
-                                       'recall': recall,
-                                       'f1_score': f1_score
-                                   },
-                                   epoch)
+                # writer.add_scalars('{}_APRF'.format(phase),
+                #                    {
+                #                        'accuracy': accuracy,
+                #                        'precision': precision,
+                #                        'recall': recall,
+                #                        'f1_score': f1_score
+                #                    },
+                #                    epoch)
                 if epoch_reg_loss != 0:
                     writer.add_scalars('reg_loss'.format(phase),
                                        {'{}_reg_loss'.format(phase): epoch_reg_loss},
@@ -268,6 +268,13 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                                 break
 
                         torch.save(model.state_dict(), model_save_path)
+
+                    writer.add_scalars('best_val_accuracy',
+                                       {'{}_accuracy'.format(phase): best_map},
+                                       epoch)
+                    writer.add_scalars('best_nll_loss',
+                                       {'{}_nll_loss'.format(phase): -best_score},
+                                       epoch)
 
                     if patience_counter >= patience:
                         print("Stopped at epoch {}".format(epoch))
