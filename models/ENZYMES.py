@@ -1,12 +1,10 @@
 import torch.nn.functional as F
-from boxx import timeit
-# from torch_geometric.nn import GCNConv
-from nn.conv import SAGEConv, GCNConv
-import torch_geometric
-from torch_geometric.nn import dense_diff_pool
 from torch_geometric.data import Batch
+from torch_geometric.nn import dense_diff_pool
 
 from belief_propagation import BeliefPropagation
+# from torch_geometric.nn import GCNConv
+from nn.conv import GCNConv
 from utils import *
 
 
@@ -14,12 +12,13 @@ class Net(nn.Module):
 
     def __init__(self, writer, dropout=0.0):
         super(Net, self).__init__()
-        self.conv11 = GCNConv(3, 30)
-        self.norm11 = nn.BatchNorm1d(30)
-        self.conv12 = GCNConv(30, 30)
-        self.norm12 = nn.BatchNorm1d(30)
-        self.conv13 = GCNConv(30, 30)
-        self.norm13 = nn.BatchNorm1d(30)
+        hidden_dim = 20
+        self.conv11 = GCNConv(3, hidden_dim)
+        self.norm11 = nn.BatchNorm1d(hidden_dim)
+        self.conv12 = GCNConv(hidden_dim, hidden_dim)
+        self.norm12 = nn.BatchNorm1d(hidden_dim)
+        self.conv13 = GCNConv(hidden_dim, hidden_dim)
+        self.norm13 = nn.BatchNorm1d(hidden_dim)
 
         bp_params = dict(mean_degree=3.8,
                          summary_writer=None,
@@ -34,23 +33,23 @@ class Net(nn.Module):
         self.bp2 = BeliefPropagation(3, bp_max_diff=3e-1, **bp_params)
         self.bp3 = BeliefPropagation(4, bp_max_diff=3e-1, **bp_params)
         self.bp4 = BeliefPropagation(5, bp_max_diff=3e-1, **bp_params)
-        self.bp5 = BeliefPropagation(6, bp_max_diff=2e-1, **bp_params)
-        self.bp6 = BeliefPropagation(7, bp_max_diff=2e-1, **bp_params)
-        self.bp7 = BeliefPropagation(8, bp_max_diff=2e-1, **bp_params)
+        # self.bp5 = BeliefPropagation(6, bp_max_diff=2e-1, **bp_params)
+        # self.bp6 = BeliefPropagation(7, bp_max_diff=2e-1, **bp_params)
+        # self.bp7 = BeliefPropagation(8, bp_max_diff=2e-1, **bp_params)
 
-        self.pool_dim = 100
-        self.pool_fc1 = nn.Linear(35, self.pool_dim)
+        self.pool_dim = 4
+        self.pool_fc1 = nn.Linear(14, self.pool_dim)
         # self.pool_fc2 = nn.Linear(100, self.pool_dim)
 
-        self.conv21 = GCNConv(30, 30)
-        self.norm21 = nn.BatchNorm1d(30)
-        self.conv22 = GCNConv(30, 30)
-        self.norm22 = nn.BatchNorm1d(30)
-        self.conv23 = GCNConv(30, 30)
-        self.norm23 = nn.BatchNorm1d(30)
+        self.conv21 = GCNConv(hidden_dim, hidden_dim)
+        self.norm21 = nn.BatchNorm1d(hidden_dim)
+        self.conv22 = GCNConv(hidden_dim, hidden_dim)
+        self.norm22 = nn.BatchNorm1d(hidden_dim)
+        self.conv23 = GCNConv(hidden_dim, hidden_dim)
+        self.norm23 = nn.BatchNorm1d(hidden_dim)
 
         self.drop1 = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(30 * 6, 50)
+        self.fc1 = nn.Linear(hidden_dim * 6, 50)
         # self.bn1 = nn.BatchNorm1d(30)
         self.drop2 = nn.Dropout(dropout)
         self.fc2 = nn.Linear(50, 6)
@@ -88,10 +87,10 @@ class Net(nn.Module):
         _, s12, _ = self.bp2(edge_index, num_nodes, edge_attr)
         _, s13, _ = self.bp3(edge_index, num_nodes, edge_attr)
         _, s14, _ = self.bp4(edge_index, num_nodes, edge_attr)
-        _, s15, _ = self.bp5(edge_index, num_nodes, edge_attr)
-        _, s16, _ = self.bp6(edge_index, num_nodes, edge_attr)
-        _, s17, _ = self.bp7(edge_index, num_nodes, edge_attr)
-        s1 = torch.cat([s11, s12, s13, s14, s15, s16, s17], dim=-1)
+        # _, s15, _ = self.bp5(edge_index, num_nodes, edge_attr)
+        # _, s16, _ = self.bp6(edge_index, num_nodes, edge_attr)
+        # _, s17, _ = self.bp7(edge_index, num_nodes, edge_attr)
+        s1 = torch.cat([s11, s12, s13, s14], dim=-1)
         # t1 = self.batch_bp(batch.to_data_list())
         s1 = self.pool_fc1(s1)
 
@@ -278,7 +277,6 @@ class ASSEMBLY(nn.Module):
     @property
     def device(self):
         return self.conv11.weight.device
-
 
 
 class SAGE_DIFFPOOL(nn.Module):

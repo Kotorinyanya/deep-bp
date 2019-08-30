@@ -147,3 +147,38 @@ def _save_node_dict(csc_map, dok_map, num_messages, device, dst_node, save_path)
     w, r, i = _node_to_slice_and_index_psi(dst_node, csc_map, num_messages, device='cpu')
     d[dst_node]['psi'] = (w, r, i)
     torch.save(d, save_path)
+
+
+def job_list_to_wri(job_list, message_update_dict, psi_update_dict):
+    message_wris = [
+        [
+            [torch.cat(w), torch.cat(r), torch.cat(i)]
+            for (w, r, i) in
+            [(zip(*(message_update_dict[n] for n in job)))]
+        ][0]
+        for job in job_list]
+
+    psi_wris = [
+        [
+            [torch.cat(w), torch.cat(r), torch.cat(i)]
+            for (w, r, i) in
+            [(zip(*(psi_update_dict[n] for n in job)))]
+        ][0]
+        for job in job_list]
+
+    return message_wris, psi_wris
+
+
+def pre_transfrom(data):
+    from belief_propagation import BeliefPropagation
+    data = pad_with_zero(126, data)
+    num_nodes = data.x.shape[0]
+
+    bp = BeliefPropagation(1)
+    bp.init_bp(data.edge_index, num_nodes, data.edge_attr)
+    job_list, message_update_dict, psi_update_dict = \
+        bp.job_list, bp._saved_message_update_dict, bp._saved_psi_update_dict
+    message_wris, psi_wris = job_list_to_wri(job_list, message_update_dict, psi_update_dict)
+    data['message_wris'] = message_wris
+    data['psi_wris'] = psi_wris
+    return data

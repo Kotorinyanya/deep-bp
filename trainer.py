@@ -11,7 +11,7 @@ from tensorboardX import SummaryWriter
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm_notebook
-from torch_geometric.datasets import TUDataset
+from dataset import TUDataset
 
 from utils import get_model_log_dir, pad_with_zero
 import time
@@ -194,6 +194,7 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                         # print(torch.autograd.grad(y_hat.sum(), model.saved_x, retain_graph=True))
                         optimizer.zero_grad()
                         total_loss.backward(retain_graph=True)
+                        nn.utils.clip_grad_norm(model.parameters(), 2.0)
                         optimizer.step()
 
                     _, predicted = torch.max(y_hat, 1)
