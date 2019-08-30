@@ -15,6 +15,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 def my_uuid(string):
     return hashlib.sha256(str(string).encode('utf-8')).hexdigest()
 
+
 def use_logging(level='info'):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -100,14 +101,14 @@ def compute_modularity(G, marginal_psi):
     return modularity
 
 
-def compute_reg(marginal_psi, adjacency_matrix, edge_index):
+def modularity_reg(assignment, edge_index, edge_attr=None):
     """
     continues version of negative modularity (with positive value)
     :return:
     """
-    reg = torch.tensor([0], dtype=torch.float)
-    for i, j in edge_index.t():
-        reg += adjacency_matrix[i, j] * torch.pow((marginal_psi[i] - marginal_psi[j]), 2).sum()
+    edge_attr = 1 if edge_attr is None else edge_attr
+    row, col = edge_index
+    reg = (edge_attr * torch.pow((assignment[row] - assignment[col]), 2).sum(1)).mean()
     return reg
 
 
@@ -156,14 +157,14 @@ def networkx_to_data(G, node_feature_dim=0):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def edge_index_to_csr(edge_index, num_nodes, edge_attr=None):
+def edge_index_to_csr(edge_index, num_nodes=None, edge_attr=None):
     """
     coo_matrix(coordinate matrix) is fast to get row
     :param edge_index: Tensor
     :param edge_attr: Tensor
     :return:
     """
-    # num_nodes = int(edge_index.max()) + 1
+    num_nodes = int(edge_index.max()) + 1 if num_nodes is None else num_nodes
     if edge_index.min() < 0:
         edge_index -= edge_index.min()
     shape = (num_nodes, num_nodes)
@@ -203,6 +204,7 @@ def pad_with_zero(max_x_size, data):
     :return:
     """
     x = data.x
+    # data.org_num_nodes = data.num_nodes
     data.num_nodes = max_x_size
     padded_x = torch.zeros(max_x_size, x.shape[1])
     padded_x[:x.shape[0], :] = x
