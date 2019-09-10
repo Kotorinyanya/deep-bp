@@ -236,10 +236,10 @@ class BeliefPropagation(nn.Module):
         self.logger.info("BP Initialization Completed")
 
     def bp_logging(self, num_iter, max_diff):
-        is_converged = True if max_diff < self.bp_max_diff else False
+        self.is_converged = True if max_diff < self.bp_max_diff else False
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
         self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1} \t max_diff \t {2:.2e}"
-                         .format(is_converged, num_iter, max_diff))
+                         .format(self.is_converged, num_iter, max_diff))
         if self.writer is not None:
             self.writer.add_scalar("beta", self.beta.item(), self.global_step)
             if self.beta.grad is not None:  # at step 0, gradient is not computed
@@ -253,8 +253,8 @@ class BeliefPropagation(nn.Module):
                     self.writer.add_histogram("bp_hist/psi_dim{}".format(i), self.marginal_psi[:, i].flatten(),
                                               self.global_step)
             self.global_step += 1
-        if not is_converged:
-            self.logger.info("SG:BP failed to converge with max_num_iter={0}, beta={1:.5f}, max_diff={2:.2e}. "
+        if not self.is_converged:
+            self.logger.info("SG:BP failed to converge with max_num_iter={0}, beta={1}, max_diff={2}. "
                              .format(num_iter, self.beta.data, max_diff))
             self.logger.info("parallel_max_node_percent={0:.2f}, in case of parallelization, "
                              "reducing this percentage is good for BP to converge"

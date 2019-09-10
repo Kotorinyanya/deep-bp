@@ -12,7 +12,7 @@ class Net(nn.Module):
 
     def __init__(self, writer, dropout=0.0):
         super(Net, self).__init__()
-        hidden_dim = 20
+        hidden_dim = 30
         self.conv11 = GCNConv(3, hidden_dim)
         self.norm11 = nn.BatchNorm1d(hidden_dim)
         self.conv12 = GCNConv(hidden_dim, hidden_dim)
@@ -27,19 +27,20 @@ class Net(nn.Module):
                          is_logging=True,
                          verbose_iter=False,
                          save_full_init=True,
-                         batch_run=False)
+                         batch_run=False,)
 
-        self.bp1 = BeliefPropagation(2, bp_max_diff=4e-1, **bp_params)
-        self.bp2 = BeliefPropagation(3, bp_max_diff=3e-1, **bp_params)
-        self.bp3 = BeliefPropagation(4, bp_max_diff=3e-1, **bp_params)
-        self.bp4 = BeliefPropagation(5, bp_max_diff=3e-1, **bp_params)
+        # self.bp1 = BeliefPropagation(2, bp_max_diff=4e-1, **bp_params)
+        self.bp = BeliefPropagation(3, bp_max_diff=3e-1, **bp_params)
+        # self.bp3 = BeliefPropagation(4, bp_max_diff=3e-1, **bp_params)
+        # self.bp4 = BeliefPropagation(5, bp_max_diff=3e-1, **bp_params)
         # self.bp5 = BeliefPropagation(6, bp_max_diff=2e-1, **bp_params)
         # self.bp6 = BeliefPropagation(7, bp_max_diff=2e-1, **bp_params)
         # self.bp7 = BeliefPropagation(8, bp_max_diff=2e-1, **bp_params)
 
-        self.pool_dim = 4
-        self.pool_fc1 = nn.Linear(14, self.pool_dim)
+        # self.pool_dim = 3
+        # self.pool_fc1 = nn.Linear(14, self.pool_dim)
         # self.pool_fc2 = nn.Linear(100, self.pool_dim)
+        # self.pool_fc = nn.Linear(3, 3)
 
         self.conv21 = GCNConv(hidden_dim, hidden_dim)
         self.norm21 = nn.BatchNorm1d(hidden_dim)
@@ -49,7 +50,7 @@ class Net(nn.Module):
         self.norm23 = nn.BatchNorm1d(hidden_dim)
 
         self.drop1 = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(hidden_dim * 6, 50)
+        self.fc1 = nn.Linear(180, 50)
         # self.bn1 = nn.BatchNorm1d(30)
         self.drop2 = nn.Dropout(dropout)
         self.fc2 = nn.Linear(50, 6)
@@ -77,52 +78,57 @@ class Net(nn.Module):
         x13 = self.norm13(x13)
         x1 = torch.cat([x11, x12, x13], dim=-1)
         # max pooling
-        x1_out, _ = torch.max(x1.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1), dim=1)
+        conv_out, _ = torch.max(x1.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1), dim=1)
 
         # edge_index = [data.edge_index for data in data_list]
         # edge_attr = [data.edge_attr for data in data_list]
         # num_nodes = int(batch.num_nodes / batch.num_graphs)
         num_nodes = batch.num_nodes
-        _, s11, _ = self.bp1(edge_index, num_nodes, edge_attr)
-        _, s12, _ = self.bp2(edge_index, num_nodes, edge_attr)
-        _, s13, _ = self.bp3(edge_index, num_nodes, edge_attr)
-        _, s14, _ = self.bp4(edge_index, num_nodes, edge_attr)
+        # _, s11, _ = self.bp1(edge_index, num_nodes, edge_attr)
+        # _, s12, _ = self.bp2(edge_index, num_nodes, edge_attr)
+        # _, s13, _ = self.bp3(edge_index, num_nodes, edge_attr)
+        # _, s14, _ = self.bp4(edge_index, num_nodes, edge_attr)
         # _, s15, _ = self.bp5(edge_index, num_nodes, edge_attr)
         # _, s16, _ = self.bp6(edge_index, num_nodes, edge_attr)
         # _, s17, _ = self.bp7(edge_index, num_nodes, edge_attr)
-        s1 = torch.cat([s11, s12, s13, s14], dim=-1)
+        # s1 = torch.cat([s11, s12, s13, s14], dim=-1)
         # t1 = self.batch_bp(batch.to_data_list())
-        s1 = self.pool_fc1(s1)
+        # s1 = self.pool_fc1(s1)
+        _, s1, _ = self.bp(edge_index, num_nodes, edge_attr)
+        # s1 = self.pool_fc(s1)
 
-        p1_ml = modularity_reg(s1, edge_index)
-
+        p1_ml, p1_el = None, None
         x13 = x13.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1)
-        s1 = s1.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1)
-        # print(torch.softmax(s1, dim=-1)[0])
+        for s in [s1]:
+            ml = modularity_reg(s, edge_index)
+            s = s.reshape(batch.num_graphs, int(batch.num_nodes / batch.num_graphs), -1)
 
-        p1_x, p1_adj, p1_ll, p1_el = dense_diff_pool(x13, adj, s1)
+            p1_x, p1_adj, p1_ll, el = dense_diff_pool(x13, adj, s)
 
-        data_list = []
-        for i in range(p1_adj.shape[0]):
-            edge_index, edge_attr = adj_to_edge_index(p1_adj[i].cpu().detach().numpy())
-            edge_index, edge_attr = edge_index.to(self.device), edge_attr.to(self.device)
-            data_list.append(Data(edge_index=edge_index, edge_attr=edge_attr))
-        p1_batch = Batch.from_data_list(data_list)
-        p1_edge_index, p1_edge_attr = p1_batch.edge_index, p1_batch.edge_attr
-        p1_edge_attr = p1_edge_attr.view(-1)
-        p1_x = p1_x.reshape(-1, p1_x.shape[-1])
+            data_list = []
+            for i in range(p1_adj.shape[0]):
+                edge_index, edge_attr = adj_to_edge_index(p1_adj[i].cpu().detach().numpy())
+                edge_index, edge_attr = edge_index.to(self.device), edge_attr.to(self.device)
+                data_list.append(Data(edge_index=edge_index, edge_attr=edge_attr))
+            p1_batch = Batch.from_data_list(data_list)
+            p1_edge_index, p1_edge_attr = p1_batch.edge_index, p1_batch.edge_attr
+            p1_edge_attr = p1_edge_attr.view(-1)
+            p1_x = p1_x.reshape(-1, p1_x.shape[-1])
 
-        x21 = self.conv21(p1_x, p1_edge_index, p1_edge_attr)
-        x21 = self.norm21(x21)
-        x22 = self.conv22(x21, p1_edge_index, p1_edge_attr)
-        x22 = self.norm22(x22)
-        x23 = self.conv23(x22, p1_edge_index, p1_edge_attr)
-        x23 = self.norm23(x23)
-        x2 = torch.cat([x21, x22, x23], dim=-1)
-        # max pooling
-        x2_out, _ = torch.max(x2.reshape(batch.num_graphs, self.pool_dim, -1), dim=1)
+            x21 = self.conv21(p1_x, p1_edge_index, p1_edge_attr)
+            x21 = self.norm21(x21)
+            x22 = self.conv22(x21, p1_edge_index, p1_edge_attr)
+            x22 = self.norm22(x22)
+            x23 = self.conv23(x22, p1_edge_index, p1_edge_attr)
+            x23 = self.norm23(x23)
+            x2 = torch.cat([x21, x22, x23], dim=-1)
+            # max pooling
+            x2_out, _ = torch.max(x2.reshape(batch.num_graphs, s.shape[2], -1), dim=1)
 
-        conv_out = torch.cat([x1_out, x2_out], dim=-1)
+            conv_out = torch.cat([conv_out, x2_out], dim=-1)
+            p1_ml = ml + p1_ml if p1_ml is not None else ml
+            p1_el = el + p1_el if p1_el is not None else el
+
         out = self.fc1(self.drop1(conv_out))
         out = self.fc2(F.relu(self.drop2(out)))
 
@@ -144,7 +150,8 @@ class Net(nn.Module):
 
     @property
     def device(self):
-        return self.bp1.beta.device
+        return self.conv11.weight\
+            .device
 
 
 class ASSEMBLY(nn.Module):

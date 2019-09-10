@@ -11,7 +11,7 @@ from tensorboardX import SummaryWriter
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm_notebook
-from dataset import TUDataset
+from torch_geometric.datasets import TUDataset
 
 from utils import get_model_log_dir, pad_with_zero
 import time
@@ -102,7 +102,7 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
     criterion = nn.CrossEntropyLoss()
 
     print("Training {0} {1} models for cross validation...".format(n_splits, model_name))
-    folds, fold = KFold(n_splits=n_splits, shuffle=True, random_state=seed), 0
+    folds, fold = KFold(n_splits=n_splits, shuffle=True, random_state=1), 0
     print(dataset.__len__())
 
     for train_idx, test_idx in tqdm_notebook(folds.split(list(range(dataset.__len__())),
@@ -120,6 +120,12 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
 
         model = model_cls(writer, dropout=dropout)
 
+        # seed for dataloader
+        torch.manual_seed(1)
+        np.random.seed(1)
+        if use_gpu:
+            torch.cuda.manual_seed_all(1)
+
         train_dataloader = DataLoader(dataset.__indexing__(train_idx),
                                       shuffle=True,
                                       batch_size=batch_size,
@@ -132,6 +138,11 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                                      collate_fn=lambda data_list: data_list,
                                      num_workers=num_workers,
                                      pin_memory=pin_memory)
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if use_gpu:
+            torch.cuda.manual_seed_all(seed)
 
         if fold == 1 or fold_no is not None:
             print(model)
@@ -194,7 +205,7 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                         # print(torch.autograd.grad(y_hat.sum(), model.saved_x, retain_graph=True))
                         optimizer.zero_grad()
                         total_loss.backward(retain_graph=True)
-                        nn.utils.clip_grad_norm(model.parameters(), 2.0)
+                        nn.utils.clip_grad_norm_(model.parameters(), 2.0)
                         optimizer.step()
 
                     _, predicted = torch.max(y_hat, 1)

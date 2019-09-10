@@ -212,6 +212,11 @@ def pad_with_zero(max_x_size, data):
     return data
 
 
+def create_node_features(size, data):
+    data.x = torch.ones(3782, size)
+    return data
+
+
 def count_memory(tensors):
     total = 0
     for obj in tensors:
