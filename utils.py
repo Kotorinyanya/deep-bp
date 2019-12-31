@@ -209,6 +209,11 @@ def pad_with_zero(max_x_size, data):
     padded_x = torch.zeros(max_x_size, x.shape[1])
     padded_x[:x.shape[0], :] = x
     data.x = padded_x
+    if data.pos is not None:
+        pos = data.pos
+        padded_pos = torch.zeros(max_x_size, pos.shape[1])
+        padded_pos[:pos.shape[0], :] = pos
+        data.pos = padded_pos
     return data
 
 

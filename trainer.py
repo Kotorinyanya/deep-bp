@@ -36,8 +36,10 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                            comment='', tb_service_loc='192.168.192.57:6006', batch_size=1,
                            num_workers=0, pin_memory=False, cuda_device=None,
                            ddp_port='23456', fold_no=None, saved_model_path=None,
-                           device_ids=None, patience=20, seed=None, save_model=False):
+                           device_ids=None, patience=20, seed=None, save_model=False,
+                           is_reg=True):
     """
+    :param is_reg:
     :param save_model: bool
     :param seed:
     :param patience: for early stopping
@@ -199,7 +201,7 @@ def train_cross_validation(model_cls, dataset, dropout=0.0, lr=1e-3,
                         y = torch.cat([y, data.y.view(-1).to(device)])
 
                     loss = criterion(y_hat, y)
-                    total_loss = (loss + reg).mean()
+                    total_loss = (loss + reg).sum() if is_reg else loss.sum()
 
                     if phase == 'train':
                         # print(torch.autograd.grad(y_hat.sum(), model.saved_x, retain_graph=True))
@@ -302,5 +304,5 @@ if __name__ == "__main__":
                         transform=trans)
     model = Net
     train_cross_validation(model, dataset, comment='bp_enzymes', batch_size=20,
-                           num_epochs=500, dropout=0.1, lr=1e-2, weight_decay=0,
+                           num_epochs=500, dropout=0.1, lr=1e-3, weight_decay=0,
                            use_gpu=False, dp=False, ddp=False, device_ids=[4, 5, 6, 7])
