@@ -726,3 +726,5 @@ if __name__ == '__main__':
     message_map, marginal_psi, message_index_list = bp(edge_index, G.number_of_nodes())
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)
+
+
