@@ -12,7 +12,7 @@ import shutil
 
 import torch
 from torch_geometric.data import InMemoryDataset, download_url, extract_zip
-from torch_geometric.read import read_tu_data
+from torch_geometric.io import read_tu_data
 
 
 class SBM2v4(InMemoryDataset):

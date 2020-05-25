@@ -689,7 +689,7 @@ class BeliefPropagation(nn.Module):
 if __name__ == '__main__':
     num_groups = 2
     sizes = np.asarray([50] * num_groups)
-    epslion = 0.4
+    epslion = 0.1
     P = np.ones((num_groups, num_groups)) * 0.1
     for i in range(len(P)):
         P[i][i] = P[i][i] / epslion
@@ -699,7 +699,7 @@ if __name__ == '__main__':
     c = nx.to_scipy_sparse_matrix(G).mean() * G.number_of_nodes()
     ground_truth = []
     for i in G.nodes():
-        ground_truth.append(G.node[i]['block'])
+        ground_truth.append(G.nodes[i]['block'])
     print(c)
     epslion_ast = (np.sqrt(c) - 1) / (np.sqrt(c) - 1 + num_groups)
     print(epslion, epslion_ast, epslion < epslion_ast)
