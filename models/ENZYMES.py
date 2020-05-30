@@ -75,7 +75,7 @@ class Net(nn.Module):
         self.pool_fc = nn.Sequential(
             # nn.Dropout(dropout),
             nn.Linear(14, self.pool_dim),
-            nn.Softmax()
+            nn.Softmax(dim=-1)
         )
 
         self.conv21 = GCNConv(self.hidden_dim, self.hidden_dim)
@@ -148,7 +148,7 @@ class Net(nn.Module):
         for i in range(p1_adj.shape[0]):
             edge_index, edge_attr = adj_to_edge_index(p1_adj[i].cpu().detach().numpy())
             edge_index, edge_attr = edge_index.to(self.device), edge_attr.to(self.device)
-            data_list.append(Data(edge_index=edge_index, edge_attr=edge_attr))
+            data_list.append(Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=self.pool_dim))
         p1_batch = Batch.from_data_list(data_list)
         p1_edge_index, p1_edge_attr = p1_batch.edge_index, p1_batch.edge_attr
         p1_edge_attr = p1_edge_attr.view(-1)
@@ -187,8 +187,7 @@ class Net(nn.Module):
 
     @property
     def device(self):
-        return self.conv11.weight \
-            .device
+        return self.conv11.weight.device
 
 
 class ASSEMBLY(nn.Module):
@@ -322,10 +321,10 @@ class ASSEMBLY(nn.Module):
 
 class SAGE_DIFFPOOL(nn.Module):
 
-    def __init__(self, writer, dropout=0.0):
+    def __init__(self, writer, num_clusters, in_dim, out_dim, dropout=0.0):
         super(SAGE_DIFFPOOL, self).__init__()
 
-        self.conv11 = GCNConv(3, 30)
+        self.conv11 = GCNConv(in_dim, 30)
         self.norm11 = nn.BatchNorm1d(30)
         self.conv12 = GCNConv(30, 30)
         self.norm12 = nn.BatchNorm1d(30)
@@ -338,7 +337,7 @@ class SAGE_DIFFPOOL(nn.Module):
         self.norm_p12 = nn.BatchNorm1d(30)
         self.pool_conv13 = GCNConv(30, 100)
         self.norm_p13 = nn.BatchNorm1d(100)
-        self.pool_fc = nn.Linear(160, 100)
+        self.pool_fc = nn.Linear(160, num_clusters)
 
         self.conv21 = GCNConv(30, 30)
         self.norm21 = nn.BatchNorm1d(30)
@@ -351,7 +350,7 @@ class SAGE_DIFFPOOL(nn.Module):
         self.fc1 = nn.Linear(30 * 6, 50)
         # self.bn1 = nn.BatchNorm1d(30)
         self.drop2 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(50, 6)
+        self.fc2 = nn.Linear(50, out_dim)
 
     def forward(self, batch):
         if type(batch) == list:  # Data list
@@ -420,7 +419,7 @@ class SAGE_DIFFPOOL(nn.Module):
         reg = p1_el + p1_ml
         # reg = torch.tensor([0.], device=self.device)
 
-        return out, reg
+        return out, -reg
 
     @property
     def device(self):
@@ -439,4 +438,4 @@ if __name__ == '__main__':
 
     train_cross_validation(model, dataset, comment='deepbp_enzymes_fixbp10_predmlp_mean_elml_p100x2', batch_size=5,
                            num_epochs=10, patience=10, dropout=0, lr=1e-3, weight_decay=0,
-                           use_gpu=False, dp=False, ddp=False, is_reg=True)
+                           use_gpu=False, dp=False, ddp=False, c_reg=True)

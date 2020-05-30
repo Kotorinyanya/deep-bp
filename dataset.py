@@ -12,7 +12,60 @@ import shutil
 
 import torch
 from torch_geometric.data import InMemoryDataset, download_url, extract_zip
-from torch_geometric.io import read_tu_data
+from torch_geometric.read import read_tu_data
+
+from utils import sbm_g_to_data
+
+
+class SBM4(InMemoryDataset):
+    def __init__(self, root, transform=None, pre_transform=None,
+                 seed=0):
+        self.seed = seed
+        self.num_graphs = 100
+        self.N = 100
+        self.epslions = np.arange(1, 11) * 0.05
+
+        super(SBM4, self).__init__(root, transform, pre_transform)
+        self.data, self.slices = torch.load(self.processed_paths[0])
+
+    @property
+    def raw_file_names(self):
+        return ''
+
+    @property
+    def processed_file_names(self):
+        return 'SBM4-{}.pt'.format(self.N)
+
+    def download(self):
+        pass
+
+    def process(self):
+        data_list = sum([self._generate_smb(4, e, int(self.num_graphs / len(self.epslions))) for e in self.epslions],
+                        [])
+        # random.seed(self.seed)
+        random.shuffle(data_list)
+
+        self.data, self.slices = self.collate(data_list)
+        torch.save((self.data, self.slices), self.processed_paths[0])
+
+    def _generate_smb(self, num_groups, epslion, num_graphs):
+
+        sizes = np.asarray([int(self.N / num_groups)] * num_groups)
+        P = np.ones((num_groups, num_groups)) * 0.05
+        for i in range(len(P)):
+            P[i][i] = P[i][i] / epslion
+
+        seeed = self.seed
+        data_list = []
+        todo_count = num_graphs
+        with tqdm(desc="_generate_sbm_{}".format(epslion), total=todo_count) as pbar:
+            while todo_count > 0:
+                G = nx.stochastic_block_model(sizes, P, seed=seeed)
+                data_list.append(sbm_g_to_data(G))
+                seeed += 1
+                todo_count -= 1
+                pbar.update()
+        return data_list
 
 
 class SBM2v4(InMemoryDataset):
@@ -252,6 +305,7 @@ class TUDataset(InMemoryDataset):
 
 
 if __name__ == '__main__':
-    dataset = TUDataset(root='datasets/ENZYMES', name='ENZYMES',
-                        pre_transform=pre_transfrom)
+    # dataset = TUDataset(root='datasets/ENZYMES', name='ENZYMES',
+    #                     pre_transform=pre_transfrom)
+    dataset = SBM4(root='datasets/SBM4')
     pass

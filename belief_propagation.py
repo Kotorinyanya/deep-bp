@@ -236,6 +236,7 @@ class BeliefPropagation(nn.Module):
         self.logger.info("BP Initialization Completed")
 
     def bp_logging(self, num_iter, max_diff):
+        self.num_iter = num_iter
         self.is_converged = True if max_diff < self.bp_max_diff else False
         self.logger.info("BP STATUS: \t beta \t {0}".format(self.beta.data))
         self.logger.info("BP STATUS: is_converge \t {0} \t iterations \t {1} \t max_diff \t {2:.2e}"
@@ -726,5 +727,3 @@ if __name__ == '__main__':
     message_map, marginal_psi, message_index_list = bp(edge_index, G.number_of_nodes())
     entropy_loss = entropy(marginal_psi)
     print(entropy_loss)
-
-

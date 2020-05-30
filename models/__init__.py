@@ -1,4 +1,6 @@
 __all__ = [
     'ENZYMES',
-    'BAVSER'
+    'BAVSER',
+    'community_detection',
+    'classification',
 ]

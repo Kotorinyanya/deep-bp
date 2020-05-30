@@ -1,3 +1,4 @@
+import random
 from functools import reduce
 import hashlib
 
@@ -7,9 +8,11 @@ from torch import nn
 import numpy as np
 from itertools import permutations, product
 import networkx as nx
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 import os.path as osp
 from scipy.sparse import coo_matrix, csr_matrix
+from torch_geometric.utils.num_nodes import maybe_num_nodes
+from torch_scatter import scatter_add
 
 
 def my_uuid(string):
@@ -64,6 +67,21 @@ def csr_matrix_equal(a1, a2):
             np.array_equal(a1.data, a2.data))
 
 
+def permutation_invariant_loss(y, label):
+    criterion = nn.NLLLoss()
+
+    perms = list(permutations(range(0, torch.max(label) + 1)))
+    combs = list(product(perms, perms))
+    losses = []
+    for p in perms:
+        i_label = label.clone()
+        for i in torch.unique(label):
+            i_label[label == i] = p[i]
+        losses.append(criterion(y, i_label))
+
+    return torch.stack(losses).min()
+
+
 def overlap(s1, s2):
     max_overlap = 0
     perms = list(permutations(range(0, np.max(s1) + 1)))
@@ -112,12 +130,45 @@ def modularity_reg(assignment, edge_index, edge_attr=None):
     return reg
 
 
+def real_modularity(assignment, edge_index, edge_attr=None):
+    if edge_attr is None:
+        edge_attr = edge_index.new_ones(edge_index.shape[1])
+    edge_attr = edge_attr.reshape(-1).float()
+    assert edge_index.shape[1] == edge_attr.shape[0]
+
+    degree = scatter_add(edge_attr, edge_index[0], dim=0)
+    m = edge_index.shape[1]
+
+    row, col = edge_index
+
+    Q = ((edge_attr - degree[row] * degree[col] / (2 * m)) * (assignment[row] * assignment[col]).sum(1)).sum() / (2 * m)
+
+    return Q
+
+
 def compute_free_energy():
     """
     Q: is free_energy required as an output ?
     :return:
     """
     pass
+
+
+def sbm_g_to_data(G):
+    adj = nx.to_numpy_array(G)
+    edge_index, _ = adj_to_edge_index(adj)
+
+    # SBM blocks
+    ground_truth = []
+    for i in G.nodes():
+        ground_truth.append(G.nodes[i]['block'])
+
+    x = torch.ones(G.number_of_nodes(), 1)
+    # x = np.arange(G.number_of_nodes())
+    # np.random.shuffle(x)
+    x = torch.tensor(x).reshape(-1, 1).float()
+    y = torch.tensor(ground_truth, dtype=torch.long)
+    return Data(x=x, edge_index=edge_index, y=y, num_nodes=G.number_of_nodes())
 
 
 def add_self_loops_with_edge_attr(edge_index, edge_attr, num_nodes=None):
@@ -191,9 +242,23 @@ def csr_to_symmetric(csr_matrix):
 def adj_to_edge_index(adj):
     A = coo_matrix(adj)
     edge_index = torch.tensor(np.stack([A.row, A.col]), dtype=torch.long)
-    edge_attr = torch.tensor(A.data).unsqueeze(-1)
+    edge_attr = torch.tensor(A.data).unsqueeze(-1).float()
 
     return edge_index, edge_attr
+
+
+def from_2d_tensor_adj(adj):
+    """
+    maintain gradients
+    Args:
+        A : Tensor (num_nodes, num_nodes)
+    """
+    assert adj.dim() == 2
+    edge_index = adj.nonzero().t().detach()
+    row, col = edge_index
+    edge_weight = adj[row, col]
+
+    return edge_index, edge_weight
 
 
 def pad_with_zero(max_x_size, data):
@@ -204,7 +269,7 @@ def pad_with_zero(max_x_size, data):
     :return:
     """
     x = data.x
-    # data.org_num_nodes = data.num_nodes
+    data.org_num_nodes = data.num_nodes
     data.num_nodes = max_x_size
     padded_x = torch.zeros(max_x_size, x.shape[1])
     padded_x[:x.shape[0], :] = x
@@ -239,3 +304,23 @@ def count_memory(tensors):
         except Exception as e:
             pass
     print("{} GB".format(total / ((1024 ** 3) * 8)))
+
+
+def dataset_gather(dataset, shuffle=True, seed=0, n_repeat=10, n_splits=10):
+    gathered_batch_list = []
+    for _ in range(n_repeat):
+        idx = np.arange(len(dataset))
+        if shuffle or n_repeat != 1:
+            random.Random(seed).shuffle(idx)
+        seed = seed + 1 if seed is not None else seed
+        idxs = [idx[j::n_splits] for j in range(n_splits)]
+        for ii in idxs:
+            batch = Batch.from_data_list([dataset.__getitem__(int(i)) for i in ii])
+            gathered_batch_list.append(batch)
+
+    return gathered_batch_list
+
+
+def find_x_dim_max(dataset):
+    x_dims = [data.x.shape[0] for data in dataset]
+    return max(x_dims)
