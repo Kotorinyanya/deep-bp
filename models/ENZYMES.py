@@ -331,13 +331,15 @@ class SAGE_DIFFPOOL(nn.Module):
         self.conv13 = GCNConv(30, 30)
         self.norm13 = nn.BatchNorm1d(30)
 
+        self.num_clusters = num_clusters
+
         self.pool_conv11 = GCNConv(3, 30)
         self.norm_p11 = nn.BatchNorm1d(30)
         self.pool_conv12 = GCNConv(30, 30)
         self.norm_p12 = nn.BatchNorm1d(30)
         self.pool_conv13 = GCNConv(30, 100)
         self.norm_p13 = nn.BatchNorm1d(100)
-        self.pool_fc = nn.Linear(160, num_clusters)
+        self.pool_fc = nn.Linear(160, self.num_clusters)
 
         self.conv21 = GCNConv(30, 30)
         self.norm21 = nn.BatchNorm1d(30)
@@ -352,9 +354,9 @@ class SAGE_DIFFPOOL(nn.Module):
         self.drop2 = nn.Dropout(dropout)
         self.fc2 = nn.Linear(50, out_dim)
 
-    def forward(self, batch):
-        if type(batch) == list:  # Data list
-            batch = Batch.from_data_list(batch)
+    def forward(self, data_list):
+        assert len(data_list) == 1
+        batch = data_list[0]
 
         x, edge_index, edge_attr = batch.x.to(self.device), batch.edge_index.to(self.device), batch.edge_attr
         edge_attr = edge_attr.to(self.device) if edge_attr is not None else edge_attr
@@ -410,7 +412,7 @@ class SAGE_DIFFPOOL(nn.Module):
         x23 = self.norm23(x23)
         x2 = torch.cat([x21, x22, x23], dim=-1)
         # max pooling
-        x2_out, _ = torch.max(x2.reshape(batch.num_graphs, 100, -1), dim=1)
+        x2_out, _ = torch.max(x2.reshape(batch.num_graphs, self.num_clusters, -1), dim=1)
 
         conv_out = torch.cat([x1_out, x2_out], dim=-1)
         out = self.fc1(self.drop1(conv_out))

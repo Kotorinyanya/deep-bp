@@ -52,7 +52,7 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
                            num_workers=0, pin_memory=False, cuda_device=None,
                            fold_no=None, saved_model_path=None,
                            device_ids=None, patience=50, seed=None, save_model=True,
-                           c_reg=0, base_log_dir='runs'):
+                           c_reg=0, base_log_dir='runs', base_model_save_dir='saved_models'):
     """
     :param c_reg:
     :param save_model: bool
@@ -117,10 +117,16 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
 
     criterion = nn.CrossEntropyLoss()
 
+    # get test set
+    folds = StratifiedKFold(n_splits=n_splits, shuffle=False)
+    train_val_idx, test_idx = list(folds.split(np.zeros(len(dataset)), dataset.data.y.numpy()))[0]
+    test_dataset = dataset.__indexing__(test_idx)
+    train_val_dataset = dataset.__indexing__(train_val_idx)
+
     print("Training {0} {1} models for cross validation...".format(n_splits, model_name))
     # folds, fold = KFold(n_splits=n_splits, shuffle=False, random_state=seed), 0
     folds = StratifiedKFold(n_splits=n_splits, shuffle=False)
-    iter = folds.split(np.zeros(len(dataset)), dataset.data.y.numpy())
+    iter = folds.split(np.zeros(len(train_val_dataset)), train_val_dataset.data.y.numpy())
     fold = 0
 
     for train_idx, val_idx in tqdm_notebook(iter, desc='CV', leave=False):
@@ -131,7 +137,7 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
                 continue
 
         writer = SummaryWriter(log_dir=osp.join(base_log_dir, log_dir_base + str(fold)))
-        model_save_dir = osp.join('saved_models', log_dir_base + str(fold))
+        model_save_dir = osp.join(base_model_save_dir, log_dir_base + str(fold))
 
         print("creating dataloader tor fold {}".format(fold))
 
@@ -140,13 +146,13 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
 
         # My Batch
 
-        train_dataset = dataset.__indexing__(train_idx)
-        test_dataset = dataset.__indexing__(val_idx)
+        train_dataset = train_val_dataset.__indexing__(train_idx)
+        val_dataset = train_val_dataset.__indexing__(val_idx)
 
-        train_dataset = dataset_gather(train_dataset, seed=0, n_repeat=10,
+        train_dataset = dataset_gather(train_dataset, seed=0, n_repeat=1,
                                        n_splits=int(len(train_dataset) / batch_size) + 1)
-        test_dataset = dataset_gather(test_dataset, seed=0, n_repeat=1,
-                                      n_splits=int(len(test_dataset) / batch_size) + 1)
+        val_dataset = dataset_gather(val_dataset, seed=0, n_repeat=1,
+                                      n_splits=int(len(val_dataset) / batch_size) + 1)
 
         train_dataloader = DataLoader(train_dataset,
                                       shuffle=True,
@@ -154,7 +160,7 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
                                       collate_fn=lambda data_list: data_list,
                                       num_workers=num_workers,
                                       pin_memory=pin_memory)
-        test_dataloader = DataLoader(test_dataset,
+        val_dataloader = DataLoader(val_dataset,
                                      shuffle=False,
                                      batch_size=device_count,
                                      collate_fn=lambda data_list: data_list,
@@ -191,7 +197,7 @@ def train_cross_validation(model_cls, dataset, num_clusters, dropout=0.0, lr=1e-
                     dataloader = train_dataloader
                 else:
                     model.eval()
-                    dataloader = test_dataloader
+                    dataloader = val_dataloader
 
                 # Logging
                 running_total_loss = 0.0

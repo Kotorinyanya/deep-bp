@@ -23,24 +23,21 @@ class Net(nn.Module):
             nn.Sequential(
                 nn.Linear(self.in_dim, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.conv12 = GINConv(
             nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.conv13 = GINConv(
             nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.pool_dim = self.num_clusters
@@ -61,9 +58,9 @@ class Net(nn.Module):
 
         self.pool_fc = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(2 + 3 + 4, 100),
+            nn.Linear(2 + 3 + 4, 50),
             nn.ReLU(),
-            nn.Linear(100, self.pool_dim),
+            nn.Linear(50, self.pool_dim),
             nn.Softmax(1)
         )
 
@@ -71,35 +68,30 @@ class Net(nn.Module):
             nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.conv22 = GINConv(
             nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.conv23 = GINConv(
             nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                # nn.BatchNorm1d(self.hidden_dim)
+                nn.BatchNorm1d(self.hidden_dim)
             ))
 
         self.final_fc = nn.Sequential(
-            nn.BatchNorm1d(self.hidden_dim * 6),
-            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim * 6, 50),
-            nn.BatchNorm1d(50),
+            nn.Linear(self.hidden_dim * 6, 100),
             nn.ReLU(),
+            nn.BatchNorm1d(100),
             nn.Dropout(dropout),
-            nn.Linear(50, self.out_dim),
+            nn.Linear(100, self.out_dim),
         )
 
     def forward(self, data_list):
@@ -154,6 +146,7 @@ class Net(nn.Module):
         x23 = self.conv23(x22, p1_edge_index, )
         x2 = torch.cat([x21, x22, x23], dim=-1)
         x2 = x2.reshape(p1_batch.num_graphs, int(p1_batch.num_nodes / p1_batch.num_graphs), -1)
+
         # global pooling
         x2_out, _ = torch.max(x2, dim=1)
         # x2_out += torch.mean(x2, dim=1)

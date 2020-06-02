@@ -101,9 +101,10 @@ def get_jobs(names, device_ids, num_parallel=1, batch_size=1):
             job_count = 0
             for fold in iter_item:
                 args = (model, dataset, 10)
-                kwargs = dict(comment='debugbp3-' + name, batch_size=batch_size,
-                              device_ids=[device_id], c_reg=0.01, fold_no=fold,
-                              base_log_dir='runs_debug_ENZYMES')
+                kwargs = dict(comment='bp3-' + name, batch_size=batch_size,
+                              device_ids=[device_id], c_reg=0.1, fold_no=fold,
+                              base_log_dir='runs_debug_PROTEINS_reg01_2',
+                              base_model_save_dir='saved_models/PROTEINS_reg01')
                 p = mp.Process(target=train_100,
                                args=args,
                                kwargs=kwargs)
